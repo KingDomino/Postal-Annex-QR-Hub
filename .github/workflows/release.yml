@@ -1,0 +1,98 @@
+name: Release Windows x64 & ARM64
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch_label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: PostalAnnexQRScanner-windows-x64.exe
+          - arch_label: windows-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset_name: PostalAnnexQRScanner-windows-arm64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Run unit test gate
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage release executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\PostalAnnexQRScanner.exe" "dist\${{ matrix.asset_name }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch_label }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  publish:
+    name: Generate Checksums & Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download built Windows executables
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums.txt
+        working-directory: release-artifacts
+        run: |
+          sha256sum \
+            PostalAnnexQRScanner-windows-x64.exe \
+            PostalAnnexQRScanner-windows-arm64.exe \
+            > checksums.txt
+          cat checksums.txt
+
+      - name: Upload checksums artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: release-artifacts/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-artifacts/PostalAnnexQRScanner-windows-x64.exe
+            release-artifacts/PostalAnnexQRScanner-windows-arm64.exe
+            release-artifacts/checksums.txt

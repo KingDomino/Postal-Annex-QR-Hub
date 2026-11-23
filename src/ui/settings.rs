@@ -1,0 +1,737 @@
+//! Settings modal overlay: thermal printer selection, 4" x 6" calibration, and updates.
+
+use std::time::Instant;
+
+use eframe::egui::{
+    self, Align, Color32, ComboBox, CornerRadius, DragValue, Frame, Id, Label, Layout, Margin,
+    Modal, ProgressBar, RichText, ScrollArea, Shadow, Slider, Spinner, Stroke, TextEdit, Ui,
+};
+
+use postal_annex_qr_scanner::config::AppConfig;
+use postal_annex_qr_scanner::installer;
+use postal_annex_qr_scanner::updater::{current_arch_label, CURRENT_VERSION};
+
+use super::app::{ScannerApp, TestPrintStatus, UpdatePhase};
+use super::colors::*;
+use super::{
+    close_icon_button, flat_button, font_bold, font_regular, font_semibold, format_bytes,
+    text_button_width, ButtonStyle,
+};
+
+const MODAL_WIDTH: f32 = 390.0;
+
+/// Renders the centered Settings modal over a click-blocking backdrop scrim.
+pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context, now: Instant) {
+    let mut should_close = false;
+    let mut config_changed_discrete = false;
+    let mut config_changed_continuous = false;
+
+    let max_body_height = (ctx.screen_rect().height() - 150.0).clamp(180.0, 520.0);
+
+    let modal_frame = Frame::new()
+        .fill(WHITE)
+        .stroke(Stroke::new(1.0_f32, CARD_STROKE))
+        .corner_radius(CornerRadius::same(12))
+        .shadow(Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(64),
+        })
+        .inner_margin(Margin::same(20));
+
+    let modal_response = Modal::new(Id::new("settings_modal"))
+        .backdrop_color(Color32::from_black_alpha(110))
+        .frame(modal_frame)
+        .show(ctx, |ui| {
+            ui.set_width(MODAL_WIDTH - 40.0);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+
+            // Header bar
+            ui.horizontal(|ui| {
+                ui.add(
+                    Label::new(
+                        RichText::new("Settings")
+                            .font(font_bold(18.0))
+                            .color(NAVY),
+                    )
+                    .selectable(false),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if close_icon_button(ui, 26.0, MUTED, GRAY_150)
+                        .on_hover_text("Close (Esc)")
+                        .clicked()
+                    {
+                        should_close = true;
+                    }
+                });
+            });
+
+            ui.add(egui::Separator::default().spacing(8.0));
+
+            ScrollArea::vertical()
+                .id_salt("settings_scroll")
+                .max_height(max_body_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+
+                    // Section 1: Thermal Printer
+                    printer_section(app, ui, &mut config_changed_discrete);
+
+                    ui.add(egui::Separator::default().spacing(12.0));
+
+                    // Section 2: 4" x 6" Label Calibration
+                    calibration_section(
+                        app,
+                        ui,
+                        &mut config_changed_discrete,
+                        &mut config_changed_continuous,
+                    );
+
+                    ui.add(egui::Separator::default().spacing(12.0));
+
+                    // Section 3: Updates & Info
+                    updates_section(
+                        app,
+                        ui,
+                        &mut config_changed_discrete,
+                        &mut config_changed_continuous,
+                    );
+
+                    ui.add_space(4.0);
+                });
+
+            ui.add(egui::Separator::default().spacing(8.0));
+
+            // Footer bar
+            ui.horizontal(|ui| {
+                if let Some(err) = &app.config_error {
+                    ui.add(
+                        Label::new(
+                            RichText::new(format!("Save error: {err}"))
+                                .font(font_regular(11.0))
+                                .color(DANGER_TEXT),
+                        )
+                        .truncate()
+                        .selectable(false),
+                    )
+                    .on_hover_text(err.as_str());
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let font = font_bold(13.5);
+                    let w = text_button_width(ui, "Done", font.clone(), 18.0);
+                    if flat_button(
+                        ui,
+                        egui::vec2(w, 32.0),
+                        "Done",
+                        font,
+                        ButtonStyle::solid(NAVY, NAVY_HOVER, WHITE),
+                    )
+                    .clicked()
+                    {
+                        should_close = true;
+                    }
+                });
+            });
+        });
+
+    if config_changed_discrete {
+        app.config_dirty_at = Some(now);
+        app.save_config_now();
+    } else if config_changed_continuous {
+        app.config_dirty_at = Some(now);
+    }
+
+    if should_close || modal_response.should_close() {
+        app.close_settings();
+    }
+}
+
+fn section_heading(ui: &mut Ui, title: &str) {
+    ui.add(
+        Label::new(
+            RichText::new(title)
+                .font(font_bold(12.0))
+                .color(NAVY),
+        )
+        .selectable(false),
+    );
+}
+
+fn printer_section(app: &mut ScannerApp, ui: &mut Ui, changed: &mut bool) {
+    section_heading(ui, "THERMAL PRINTER");
+
+    let current_name = app.config.active_printer().map(str::to_owned);
+    let current_offline = current_name
+        .as_deref()
+        .is_some_and(|name| !app.printers_refreshing && !app.printers.iter().any(|p| p == name));
+
+    let selected_label = match &current_name {
+        Some(name) if current_offline => format!("{name} (offline)"),
+        Some(name) => name.clone(),
+        None => "Select a printer\u{2026}".to_string(),
+    };
+
+    ui.horizontal(|ui| {
+        let refresh_font = font_semibold(12.5);
+        let refresh_label = if app.printers_refreshing {
+            "Refreshing\u{2026}"
+        } else {
+            "Refresh List"
+        };
+        let refresh_w = text_button_width(ui, "Refresh List", refresh_font.clone(), 10.0).max(94.0);
+        let combo_w = (ui.available_width() - refresh_w - 8.0).max(140.0);
+
+        ComboBox::from_id_salt("printer_picker")
+            .width(combo_w)
+            .selected_text(selected_label)
+            .show_ui(ui, |ui| {
+                let is_none = app.config.active_printer().is_none();
+                if ui.selectable_label(is_none, "(No printer selected)").clicked() {
+                    app.config.printer_name = None;
+                    *changed = true;
+                }
+                if let Some(name) = &current_name {
+                    if current_offline {
+                        let label = format!("{name} (offline)");
+                        if ui.selectable_label(true, label).clicked() {
+                            app.config.printer_name = Some(name.clone());
+                        }
+                    }
+                }
+                for printer in &app.printers {
+                    let selected = current_name.as_deref() == Some(printer.as_str());
+                    if ui.selectable_label(selected, printer).clicked() {
+                        app.config.printer_name = Some(printer.clone());
+                        *changed = true;
+                    }
+                }
+            });
+
+        let style = ButtonStyle::solid(GRAY_200, GRAY_300, TEXT_BODY).with_stroke(GRAY_400);
+        if flat_button(
+            ui,
+            egui::vec2(refresh_w, 26.0),
+            refresh_label,
+            refresh_font,
+            style,
+        )
+        .clicked()
+            && !app.printers_refreshing
+        {
+            app.request_printer_refresh();
+        }
+    });
+
+    if app.printers_refreshing {
+        ui.horizontal(|ui| {
+            ui.add(Spinner::new().size(13.0).color(NAVY));
+            ui.add(
+                Label::new(
+                    RichText::new("Scanning installed printers\u{2026}")
+                        .font(font_regular(12.0))
+                        .color(MUTED),
+                )
+                .selectable(false),
+            );
+        });
+    } else if let Some(err) = &app.printers_error {
+        ui.add(
+            Label::new(
+                RichText::new(err)
+                    .font(font_regular(12.0))
+                    .color(DANGER_TEXT),
+            )
+            .wrap()
+            .selectable(false),
+        );
+    }
+
+    if ui
+        .checkbox(&mut app.config.auto_print_on_scan, "Auto-print on scan")
+        .changed()
+    {
+        *changed = true;
+    }
+
+    let test_sending = app.test_print == TestPrintStatus::Sending;
+    let test_label = if test_sending {
+        "Sending Test Label\u{2026}"
+    } else {
+        "Test Print 4\" x 6\" Label"
+    };
+    let test_style = ButtonStyle::solid(GRAY_150, GRAY_300, NAVY).with_stroke(READY_BORDER);
+    if flat_button(
+        ui,
+        egui::vec2(ui.available_width(), 32.0),
+        test_label,
+        font_semibold(13.0),
+        test_style,
+    )
+    .clicked()
+        && !test_sending
+    {
+        app.send_test_print();
+    }
+
+    match &app.test_print {
+        TestPrintStatus::Idle => {}
+        TestPrintStatus::Sending => {
+            ui.horizontal(|ui| {
+                ui.add(Spinner::new().size(13.0).color(NAVY));
+                ui.add(
+                    Label::new(
+                        RichText::new("Sending 4\" x 6\" test label to spooler\u{2026}")
+                            .font(font_regular(12.0))
+                            .color(MUTED),
+                    )
+                    .selectable(false),
+                );
+            });
+        }
+        TestPrintStatus::Sent => {
+            ui.add(
+                Label::new(
+                    RichText::new("Test label sent to printer.")
+                        .font(font_semibold(12.0))
+                        .color(GREEN),
+                )
+                .wrap()
+                .selectable(false),
+            );
+        }
+        TestPrintStatus::Failed(msg) => {
+            ui.add(
+                Label::new(
+                    RichText::new(format!("Test print failed: {msg}"))
+                        .font(font_regular(12.0))
+                        .color(DANGER_TEXT),
+                )
+                .wrap()
+                .selectable(false),
+            );
+        }
+    }
+}
+
+fn calibration_section(
+    app: &mut ScannerApp,
+    ui: &mut Ui,
+    changed_discrete: &mut bool,
+    changed_continuous: &mut bool,
+) {
+    section_heading(ui, "4\" \u{00d7} 6\" LABEL CALIBRATION");
+
+    if ui
+        .checkbox(
+            &mut app.config.force_4x6_devmode,
+            "Force 4\" x 6\" DEVMODEW",
+        )
+        .on_hover_text("Overrides the printer driver's default paper size to 4\" x 6\" portrait.")
+        .changed()
+    {
+        *changed_discrete = true;
+    }
+
+    ui.horizontal(|ui| {
+        ui.add(
+            Label::new(
+                RichText::new("QR Size:")
+                    .font(font_regular(13.0))
+                    .color(TEXT_BODY),
+            )
+            .selectable(false),
+        );
+        let slider = Slider::new(&mut app.config.qr_size_inches, 2.0..=3.5)
+            .step_by(0.025)
+            .fixed_decimals(3)
+            .suffix("\"");
+        if ui.add(slider).changed() {
+            *changed_continuous = true;
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.add(
+            Label::new(
+                RichText::new("Offset X:")
+                    .font(font_regular(13.0))
+                    .color(TEXT_BODY),
+            )
+            .selectable(false),
+        );
+        if ui
+            .add(
+                DragValue::new(&mut app.config.offset_x_mm)
+                    .range(-20.0..=20.0)
+                    .speed(0.1)
+                    .fixed_decimals(1)
+                    .suffix(" mm"),
+            )
+            .changed()
+        {
+            *changed_continuous = true;
+        }
+
+        ui.add_space(14.0);
+
+        ui.add(
+            Label::new(
+                RichText::new("Offset Y:")
+                    .font(font_regular(13.0))
+                    .color(TEXT_BODY),
+            )
+            .selectable(false),
+        );
+        if ui
+            .add(
+                DragValue::new(&mut app.config.offset_y_mm)
+                    .range(-20.0..=20.0)
+                    .speed(0.1)
+                    .fixed_decimals(1)
+                    .suffix(" mm"),
+            )
+            .changed()
+        {
+            *changed_continuous = true;
+        }
+    });
+
+    let reset_font = font_semibold(12.5);
+    let reset_w = text_button_width(ui, "Reset Calibration", reset_font.clone(), 12.0);
+    let reset_style = ButtonStyle::solid(GRAY_200, GRAY_300, TEXT_BODY).with_stroke(GRAY_400);
+    if flat_button(
+        ui,
+        egui::vec2(reset_w, 28.0),
+        "Reset Calibration",
+        reset_font,
+        reset_style,
+    )
+    .clicked()
+    {
+        reset_calibration(&mut app.config);
+        *changed_discrete = true;
+    }
+}
+
+fn updates_section(
+    app: &mut ScannerApp,
+    ui: &mut Ui,
+    changed_discrete: &mut bool,
+    changed_continuous: &mut bool,
+) {
+    section_heading(ui, "UPDATES & INFO");
+
+    ui.horizontal(|ui| {
+        ui.add(
+            Label::new(
+                RichText::new(format!(
+                    "Version: v{CURRENT_VERSION}   \u{2022}   Architecture: {}",
+                    current_arch_label()
+                ))
+                .font(font_regular(12.5))
+                .color(MUTED),
+            )
+            .selectable(false),
+        );
+    });
+
+    if ui
+        .checkbox(
+            &mut app.config.auto_check_updates,
+            "Check for updates on startup",
+        )
+        .changed()
+    {
+        *changed_discrete = true;
+    }
+
+    ui.horizontal(|ui| {
+        ui.add(
+            Label::new(
+                RichText::new("GitHub Repo:")
+                    .font(font_regular(13.0))
+                    .color(TEXT_BODY),
+            )
+            .selectable(false),
+        );
+        let edit = TextEdit::singleline(&mut app.config.github_repo)
+            .desired_width(ui.available_width())
+            .hint_text("owner/repo");
+        if ui.add(edit).changed() {
+            *changed_continuous = true;
+        }
+    });
+
+    let busy = matches!(
+        app.update_phase,
+        UpdatePhase::Checking
+            | UpdatePhase::Downloading { .. }
+            | UpdatePhase::Verifying
+            | UpdatePhase::ReadyToRestart
+    );
+
+    ui.horizontal(|ui| {
+        let check_font = font_semibold(12.5);
+        let check_label = if app.update_phase == UpdatePhase::Checking {
+            "Checking\u{2026}"
+        } else {
+            "Check for Updates"
+        };
+        let check_w = text_button_width(ui, "Check for Updates", check_font.clone(), 12.0);
+        let check_style = ButtonStyle::solid(GRAY_200, GRAY_300, TEXT_BODY).with_stroke(GRAY_400);
+        if flat_button(
+            ui,
+            egui::vec2(check_w, 30.0),
+            check_label,
+            check_font,
+            check_style,
+        )
+        .clicked()
+            && !busy
+        {
+            app.check_for_updates();
+        }
+
+        if app.available_update.is_some()
+            && !app.installing_update
+            && app.update_phase != UpdatePhase::ReadyToRestart
+        {
+            let install_font = font_bold(12.5);
+            let install_w = text_button_width(ui, "Update & Restart", install_font.clone(), 12.0);
+            if flat_button(
+                ui,
+                egui::vec2(install_w, 30.0),
+                "Update & Restart",
+                install_font,
+                ButtonStyle::solid(NAVY, NAVY_HOVER, WHITE),
+            )
+            .clicked()
+            {
+                app.start_update_install();
+            }
+        }
+    });
+
+    match &app.update_phase {
+        UpdatePhase::Idle => {}
+        UpdatePhase::Checking => {
+            ui.horizontal(|ui| {
+                ui.add(Spinner::new().size(13.0).color(NAVY));
+                ui.add(
+                    Label::new(
+                        RichText::new("Checking GitHub Releases\u{2026}")
+                            .font(font_regular(12.0))
+                            .color(MUTED),
+                    )
+                    .selectable(false),
+                );
+            });
+        }
+        UpdatePhase::UpToDate => {
+            ui.add(
+                Label::new(
+                    RichText::new("Up to date.")
+                        .font(font_semibold(12.0))
+                        .color(GREEN),
+                )
+                .selectable(false),
+            );
+        }
+        UpdatePhase::Available => {
+            if let Some(update) = &app.available_update {
+                ui.add(
+                    Label::new(
+                        RichText::new(format!(
+                            "Update available: v{} ({})",
+                            update.version, update.asset_name
+                        ))
+                        .font(font_semibold(12.5))
+                        .color(NAVY),
+                    )
+                    .wrap()
+                    .selectable(false),
+                );
+            }
+        }
+        UpdatePhase::Downloading { downloaded, total } => {
+            let fraction = total
+                .filter(|t| *t > 0)
+                .map(|t| (*downloaded as f32 / t as f32).clamp(0.0, 1.0));
+            let progress_text = match total {
+                Some(t) if *t > 0 => {
+                    format!(
+                        "Downloading: {} / {}",
+                        format_bytes(*downloaded),
+                        format_bytes(*t)
+                    )
+                }
+                _ => format!("Downloading: {}", format_bytes(*downloaded)),
+            };
+            ui.add(
+                Label::new(
+                    RichText::new(progress_text)
+                        .font(font_regular(12.0))
+                        .color(UPDATE_TEXT),
+                )
+                .selectable(false),
+            );
+            let bar = ProgressBar::new(fraction.unwrap_or(0.0))
+                .desired_width(ui.available_width())
+                .desired_height(10.0)
+                .fill(NAVY);
+            ui.add(if fraction.is_some() {
+                bar
+            } else {
+                bar.animate(true)
+            });
+        }
+        UpdatePhase::Verifying => {
+            ui.horizontal(|ui| {
+                ui.add(Spinner::new().size(13.0).color(NAVY));
+                ui.add(
+                    Label::new(
+                        RichText::new("Verifying SHA-256 checksum\u{2026}")
+                            .font(font_regular(12.0))
+                            .color(UPDATE_TEXT),
+                    )
+                    .selectable(false),
+                );
+            });
+        }
+        UpdatePhase::ReadyToRestart => {
+            ui.add(
+                Label::new(
+                    RichText::new("Update installed \u{2014} restarting\u{2026}")
+                        .font(font_semibold(12.0))
+                        .color(GREEN),
+                )
+                .selectable(false),
+            );
+        }
+        UpdatePhase::Error(message) => {
+            ui.add(
+                Label::new(
+                    RichText::new(message)
+                        .font(font_regular(12.0))
+                        .color(DANGER_TEXT),
+                )
+                .wrap()
+                .selectable(false),
+            );
+        }
+    }
+
+    ui.add_space(4.0);
+    if cfg!(windows) {
+        let location_text = installer::install_dir()
+            .map(|p| format!("Install folder: {}", p.display()))
+            .unwrap_or_else(|| "Install folder: %LOCALAPPDATA%\\PostalAnnexQRScanner".to_string());
+        ui.add(
+            Label::new(
+                RichText::new(location_text)
+                    .font(font_regular(11.0))
+                    .color(MUTED),
+            )
+            .truncate()
+            .selectable(false),
+        );
+    }
+
+    ui.horizontal(|ui| {
+        let btn_font = font_semibold(12.0);
+        let btn_style = ButtonStyle::solid(GRAY_200, GRAY_300, TEXT_BODY).with_stroke(GRAY_400);
+
+        let desktop_w = text_button_width(ui, "Add Desktop Shortcut", btn_font.clone(), 10.0);
+        if flat_button(
+            ui,
+            egui::vec2(desktop_w, 28.0),
+            "Add Desktop Shortcut",
+            btn_font.clone(),
+            btn_style,
+        )
+        .clicked()
+        {
+            match installer::create_desktop_shortcut() {
+                Ok(_) => {
+                    app.shortcut_feedback =
+                        Some((false, "Desktop shortcut created.".to_string()));
+                }
+                Err(err) => {
+                    app.shortcut_feedback = Some((true, err));
+                }
+            }
+        }
+
+        let start_w = text_button_width(ui, "Repair Start Menu", btn_font.clone(), 10.0);
+        if flat_button(
+            ui,
+            egui::vec2(start_w, 28.0),
+            "Repair Start Menu",
+            btn_font,
+            btn_style,
+        )
+        .clicked()
+        {
+            match installer::ensure_start_menu_shortcut() {
+                Ok(_) => {
+                    app.shortcut_feedback =
+                        Some((false, "Start Menu shortcut updated.".to_string()));
+                }
+                Err(err) => {
+                    app.shortcut_feedback = Some((true, err));
+                }
+            }
+        }
+    });
+
+    if let Some((is_err, msg)) = &app.shortcut_feedback {
+        let color = if *is_err { DANGER_TEXT } else { GREEN };
+        ui.add(
+            Label::new(RichText::new(msg).font(font_semibold(12.0)).color(color))
+                .wrap()
+                .selectable(false),
+        );
+    }
+}
+
+/// Resets the 4" x 6" label calibration parameters to factory defaults.
+pub(crate) fn reset_calibration(config: &mut AppConfig) {
+    let defaults = AppConfig::default();
+    config.force_4x6_devmode = defaults.force_4x6_devmode;
+    config.qr_size_inches = defaults.qr_size_inches;
+    config.offset_x_mm = defaults.offset_x_mm;
+    config.offset_y_mm = defaults.offset_y_mm;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_calibration_restores_defaults_without_clobbering_printer_or_repo() {
+        let mut cfg = AppConfig {
+            printer_name: Some("ZDesigner GK420d".to_string()),
+            auto_print_on_scan: false,
+            force_4x6_devmode: false,
+            qr_size_inches: 2.5,
+            offset_x_mm: 3.2,
+            offset_y_mm: -4.5,
+            github_repo: "custom/repo".to_string(),
+            ..AppConfig::default()
+        };
+
+        reset_calibration(&mut cfg);
+
+        assert!(cfg.force_4x6_devmode);
+        assert_eq!(cfg.qr_size_inches, 3.125);
+        assert_eq!(cfg.offset_x_mm, 0.0);
+        assert_eq!(cfg.offset_y_mm, 0.0);
+        // Unrelated settings preserved
+        assert_eq!(cfg.printer_name.as_deref(), Some("ZDesigner GK420d"));
+        assert!(!cfg.auto_print_on_scan);
+        assert_eq!(cfg.github_repo, "custom/repo");
+    }
+}
