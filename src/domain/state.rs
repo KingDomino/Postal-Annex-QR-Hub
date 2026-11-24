@@ -142,6 +142,34 @@ impl ScannerStateMachine {
                     ScreenState::AwaitingPrompt(PromptKind::CustomerPacked { payload, rma });
                 Vec::new()
             }
+            ScanRoute::Unpacked { payload, content } => {
+                if content.is_empty() {
+                    self.finalize_label(payload, None, None, None, PrintTrigger::Auto)
+                } else {
+                    let badge = Some(AlertBadge::Green {
+                        text: format!("UNPK QR Detected! Copied: {content}"),
+                    });
+                    self.finalize_label(
+                        payload,
+                        Some(content.clone()),
+                        badge,
+                        Some(content),
+                        PrintTrigger::Auto,
+                    )
+                }
+            }
+            ScanRoute::UpsTracking { payload } => {
+                let badge = Some(AlertBadge::Green {
+                    text: format!("UPS Tracking Detected! Copied: {payload}"),
+                });
+                self.finalize_label(
+                    payload.clone(),
+                    Some(payload.clone()),
+                    badge,
+                    Some(payload),
+                    PrintTrigger::Auto,
+                )
+            }
             ScanRoute::Unrecognized { payload } => {
                 self.screen = ScreenState::UnrecognizedWarning {
                     rejected_payload: payload,
@@ -175,7 +203,7 @@ impl ScannerStateMachine {
                 });
                 self.finalize_label(
                     payload,
-                    Some("Happy Return".to_string()),
+                    Some("UPS Happy Returns".to_string()),
                     badge,
                     clipboard_text,
                     PrintTrigger::Auto,
@@ -441,7 +469,7 @@ mod tests {
                 AppEffect::Print {
                     job: PrintJob {
                         payload: "HR|12345|DATA".to_string(),
-                        header: Some("Happy Return".to_string()),
+                        header: Some("UPS Happy Returns".to_string()),
                     },
                     trigger: PrintTrigger::Auto,
                 },
@@ -451,7 +479,7 @@ mod tests {
             sm.screen(),
             &ScreenState::LabelReady {
                 payload: "HR|12345|DATA".to_string(),
-                header: Some("Happy Return".to_string()),
+                header: Some("UPS Happy Returns".to_string()),
                 badge: Some(AlertBadge::Yellow {
                     text: "Full QR code copied.\n⚠ Please mark the auto-detect tracking number as UPS in PostalMate, NOT Happy Returns.".to_string(),
                 }),
@@ -565,5 +593,96 @@ mod tests {
         sm.reset();
         assert_eq!(sm.screen(), &ScreenState::Ready);
         assert!(sm.last_print_job().is_none());
+    }
+
+    #[test]
+    fn route_unpacked_prints_and_copies_suffix_while_encoding_full_qr() {
+        let mut sm = ScannerStateMachine::new();
+        let effects = sm.handle_scan("unpk-Box789-Item");
+
+        assert_eq!(
+            effects,
+            vec![
+                AppEffect::CopyToClipboard("bOX789-iTEM".to_string()),
+                AppEffect::GenerateQr {
+                    payload: "UNPK-bOX789-iTEM".to_string(),
+                    scan_nonce: 1,
+                },
+                AppEffect::Print {
+                    job: PrintJob {
+                        payload: "UNPK-bOX789-iTEM".to_string(),
+                        header: Some("bOX789-iTEM".to_string()),
+                    },
+                    trigger: PrintTrigger::Auto,
+                },
+            ]
+        );
+
+        assert_eq!(
+            sm.screen(),
+            &ScreenState::LabelReady {
+                payload: "UNPK-bOX789-iTEM".to_string(),
+                header: Some("bOX789-iTEM".to_string()),
+                badge: Some(AlertBadge::Green {
+                    text: "UNPK QR Detected! Copied: bOX789-iTEM".to_string(),
+                }),
+                scan_nonce: 1,
+            }
+        );
+
+        // Literal "UNPK-" with empty suffix skips header/clipboard/badge while still generating QR
+        let empty_effects = sm.handle_scan("UNPK-");
+        assert_eq!(
+            empty_effects,
+            vec![
+                AppEffect::GenerateQr {
+                    payload: "UNPK-".to_string(),
+                    scan_nonce: 2,
+                },
+                AppEffect::Print {
+                    job: PrintJob {
+                        payload: "UNPK-".to_string(),
+                        header: None,
+                    },
+                    trigger: PrintTrigger::Auto,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn route_ups_1z_prints_and_copies_full_payload_immediately() {
+        let mut sm = ScannerStateMachine::new();
+        let effects = sm.handle_scan("1z12e33y3451233145");
+
+        assert_eq!(
+            effects,
+            vec![
+                AppEffect::CopyToClipboard("1Z12E33Y3451233145".to_string()),
+                AppEffect::GenerateQr {
+                    payload: "1Z12E33Y3451233145".to_string(),
+                    scan_nonce: 1,
+                },
+                AppEffect::Print {
+                    job: PrintJob {
+                        payload: "1Z12E33Y3451233145".to_string(),
+                        header: Some("1Z12E33Y3451233145".to_string()),
+                    },
+                    trigger: PrintTrigger::Auto,
+                },
+            ]
+        );
+
+        assert_eq!(
+            sm.screen(),
+            &ScreenState::LabelReady {
+                payload: "1Z12E33Y3451233145".to_string(),
+                header: Some("1Z12E33Y3451233145".to_string()),
+                badge: Some(AlertBadge::Green {
+                    text: "UPS Tracking Detected! Copied: 1Z12E33Y3451233145".to_string(),
+                }),
+                scan_nonce: 1,
+            }
+        );
     }
 }

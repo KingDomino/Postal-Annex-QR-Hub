@@ -24,7 +24,7 @@ use postal_annex_qr_scanner::qr::{
     QrMatrix, QUIET_ZONE_MODULES,
 };
 use postal_annex_qr_scanner::updater::{
-    self, AvailableUpdate, UpdateEvent, UpdateWorker, CURRENT_VERSION,
+    self, AvailableUpdate, UpdateEvent, UpdateWorker, VersionChangelog, CURRENT_VERSION,
 };
 
 use super::colors::*;
@@ -131,7 +131,8 @@ pub struct ScannerApp {
 
     pub(super) settings_open: bool,
     pub(super) whats_new_open: bool,
-    pub(super) whats_new_notes: String,
+    pub(super) whats_new_entries: Vec<VersionChangelog>,
+    unread_since_version: Option<String>,
     pub(super) printers: Vec<String>,
     pub(super) printers_refreshing: bool,
     pub(super) printers_error: Option<String>,
@@ -161,6 +162,7 @@ impl ScannerApp {
         let ctx = cc.egui_ctx.clone();
         let fonts = install_theme(&ctx);
         let (mut config, had_existing_config) = AppConfig::load_with_existing_flag();
+        let unread_since_version = config.last_seen_version.clone();
 
         let auto_open_whats_new = should_auto_open_whats_new(
             just_updated,
@@ -168,12 +170,16 @@ impl ScannerApp {
             config.last_seen_version.as_deref(),
             CURRENT_VERSION,
         );
-        if config.last_seen_version.as_deref() != Some(CURRENT_VERSION) {
+        // On a fresh install, record the initial version right away so normal restarts stay quiet.
+        // After an update, keep `last_seen_version` at the previous version until the user closes
+        // "What's New?" so any skipped intermediate changelogs remain queued if they update again.
+        if !auto_open_whats_new && config.last_seen_version.as_deref() != Some(CURRENT_VERSION) {
             config.last_seen_version = Some(CURRENT_VERSION.to_string());
             let _ = config.save();
         }
 
-        let whats_new_notes = initial_changelog_notes();
+        let whats_new_entries =
+            updater::initial_unread_changelogs(unread_since_version.as_deref(), CURRENT_VERSION);
 
         let repaint_ctx = ctx.clone();
         let repaint_cb: Arc<dyn Fn() + Send + Sync> = Arc::new(move || repaint_ctx.request_repaint());
@@ -185,7 +191,11 @@ impl ScannerApp {
             update_worker.check(config.github_repo.clone(), true, Some(Duration::from_secs(1)));
         }
         if auto_open_whats_new {
-            update_worker.fetch_changelog(config.github_repo.clone(), CURRENT_VERSION.to_string());
+            update_worker.fetch_changelog(
+                config.github_repo.clone(),
+                unread_since_version.clone(),
+                CURRENT_VERSION.to_string(),
+            );
         }
 
         Self {
@@ -201,7 +211,8 @@ impl ScannerApp {
             pending_prints: VecDeque::new(),
             settings_open: false,
             whats_new_open: auto_open_whats_new,
-            whats_new_notes,
+            whats_new_entries,
+            unread_since_version,
             printers: Vec::new(),
             printers_refreshing: true,
             printers_error: None,
@@ -248,9 +259,12 @@ impl ScannerApp {
         self.settings_open = false;
         self.whats_new_open = true;
         self.scan_buffer.clear();
-        self.whats_new_notes = initial_changelog_notes();
+        let since = self.unread_since_version.clone();
+        self.whats_new_entries =
+            updater::initial_unread_changelogs(since.as_deref(), CURRENT_VERSION);
         self.update_worker.fetch_changelog(
             self.config.github_repo.trim().to_string(),
+            since,
             CURRENT_VERSION.to_string(),
         );
     }
@@ -258,6 +272,11 @@ impl ScannerApp {
     pub(super) fn close_whats_new(&mut self) {
         self.whats_new_open = false;
         self.scan_buffer.clear();
+        if self.config.last_seen_version.as_deref() != Some(CURRENT_VERSION) {
+            self.config.last_seen_version = Some(CURRENT_VERSION.to_string());
+            self.unread_since_version = Some(CURRENT_VERSION.to_string());
+            let _ = self.config.save();
+        }
     }
 
     pub(super) fn request_printer_refresh(&mut self) {
@@ -375,11 +394,17 @@ impl ScannerApp {
                 self.save_config_now();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            UpdateEvent::ChangelogLoaded { version, notes } => {
-                let normalized = version.trim().trim_start_matches(['v', 'V']);
-                if normalized == CURRENT_VERSION && !notes.trim().is_empty() {
-                    self.whats_new_notes = notes.clone();
-                    let _ = updater::save_cached_changelog(&version, &notes);
+            UpdateEvent::ChangelogsLoaded(entries) => {
+                if !entries.is_empty() {
+                    if let Some(current_entry) =
+                        entries.iter().find(|entry| entry.version == CURRENT_VERSION)
+                    {
+                        let _ = updater::save_cached_changelog(
+                            &current_entry.version,
+                            &current_entry.notes,
+                        );
+                    }
+                    self.whats_new_entries = entries;
                 }
             }
             UpdateEvent::Error { message, silent } => {
@@ -1186,11 +1211,6 @@ impl eframe::App for ScannerApp {
 // ---------------------------------------------------------------------------
 // Stateless homepage pieces
 // ---------------------------------------------------------------------------
-
-fn initial_changelog_notes() -> String {
-    updater::load_cached_changelog(CURRENT_VERSION)
-        .unwrap_or_else(|| updater::CURRENT_CHANGELOG.to_string())
-}
 
 fn should_auto_open_whats_new(
     just_updated: bool,

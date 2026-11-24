@@ -6,12 +6,13 @@ use eframe::egui::{
     ScrollArea, Stroke, Ui,
 };
 
-use postal_annex_qr_scanner::updater::CURRENT_VERSION;
+use postal_annex_qr_scanner::updater::{VersionChangelog, CURRENT_VERSION};
 
 use super::app::ScannerApp;
 use super::colors::*;
 use super::{
-    close_icon_button, flat_button, font_bold, font_regular, modal_frame, ButtonStyle, MODAL_WIDTH,
+    close_icon_button, flat_button, font_bold, font_regular, font_semibold, modal_frame,
+    ButtonStyle, MODAL_WIDTH,
 };
 
 /// A parsed line from a GitHub Release markdown changelog.
@@ -74,7 +75,6 @@ fn strip_markdown_heading(line: &str) -> Option<&str> {
 pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context) {
     let mut should_close = false;
     let max_body_height = (ctx.screen_rect().height() - 210.0).clamp(140.0, 380.0);
-    let parsed = parse_changelog_lines(&app.whats_new_notes);
 
     let modal_response = Modal::new(Id::new("whats_new_modal"))
         .backdrop_color(Color32::from_black_alpha(110))
@@ -94,21 +94,7 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context) {
                     .selectable(false),
                 );
 
-                Frame::new()
-                    .fill(READY_BG)
-                    .stroke(Stroke::new(1.0_f32, READY_BORDER))
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::symmetric(8, 2))
-                    .show(ui, |ui| {
-                        ui.add(
-                            Label::new(
-                                RichText::new(format!("v{CURRENT_VERSION}"))
-                                    .font(font_bold(11.5))
-                                    .color(NAVY),
-                            )
-                            .selectable(false),
-                        );
-                    });
+                version_pill(ui, CURRENT_VERSION);
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if close_icon_button(ui, 26.0, MUTED, GRAY_150)
@@ -129,7 +115,7 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 8.0);
-                    render_changelog(ui, &parsed);
+                    render_versions(ui, &app.whats_new_entries);
                 });
 
             ui.add_space(6.0);
@@ -151,6 +137,55 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context) {
 
     if should_close || modal_response.should_close() {
         app.close_whats_new();
+    }
+}
+
+fn version_pill(ui: &mut Ui, version: &str) {
+    let label = version.trim().trim_start_matches(['v', 'V']);
+    Frame::new()
+        .fill(READY_BG)
+        .stroke(Stroke::new(1.0_f32, READY_BORDER))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.add(
+                Label::new(
+                    RichText::new(format!("v{label}"))
+                        .font(font_bold(11.5))
+                        .color(NAVY),
+                )
+                .selectable(false),
+            );
+        });
+}
+
+fn render_versions(ui: &mut Ui, entries: &[VersionChangelog]) {
+    let show_version_headers = entries.len() > 1;
+    for (idx, entry) in entries.iter().enumerate() {
+        if idx > 0 {
+            ui.add_space(6.0);
+            ui.add(egui::Separator::default().spacing(6.0));
+            ui.add_space(2.0);
+        }
+        if show_version_headers {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                version_pill(ui, &entry.version);
+                ui.add(
+                    Label::new(
+                        RichText::new(format!(
+                            "Changes in v{}",
+                            entry.version.trim().trim_start_matches(['v', 'V'])
+                        ))
+                        .font(font_semibold(13.5))
+                        .color(NAVY),
+                    )
+                    .selectable(false),
+                );
+            });
+        }
+        let parsed = parse_changelog_lines(&entry.notes);
+        render_changelog(ui, &parsed);
     }
 }
 

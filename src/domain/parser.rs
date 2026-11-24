@@ -1,4 +1,4 @@
-//! Caps Lock case-inversion engine, pipe splitting, and 4-route return classifier.
+//! Caps Lock case-inversion engine, pipe splitting, and return route classifier.
 
 /// Classified route for a scanned QR payload after Caps Lock normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,7 +18,14 @@ pub enum ScanRoute {
         payload: String,
         rma: Option<String>,
     },
-    /// Priority 4: unrecognized return payload.
+    /// Priority 4: normalized payload starts with `"UNPK-"`.
+    Unpacked {
+        payload: String,
+        content: String,
+    },
+    /// Priority 5: normalized payload starts with `"1Z"`.
+    UpsTracking { payload: String },
+    /// Fallback: unrecognized return payload.
     Unrecognized { payload: String },
 }
 
@@ -40,16 +47,20 @@ pub fn flip_case(input: &str) -> String {
 
 /// Applies the pattern-based Caps Lock correction rule for known return prefixes.
 ///
-/// If the text starts with a case-insensitive known prefix (`afnlf` or `hr`) AND
-/// its first character is lowercase (`a` or `h`), Caps Lock was inverted on the
-/// scanner/workstation, so every character's case is individually inverted via [`flip_case`].
+/// If the text starts with a case-insensitive known prefix (`afnlf`, `hr`, `unpk-`, or `1z`)
+/// AND its first alphabetic character is lowercase (`a`, `h`, `u`, or `1z`), Caps Lock was
+/// inverted on the scanner/workstation, so every character's case is individually inverted
+/// via [`flip_case`].
 pub fn normalize_caps_lock(text: &str) -> String {
     let is_inverted_afnlf =
         text.starts_with('a') && text.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("afnlf"));
     let is_inverted_hr =
         text.starts_with('h') && text.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("hr"));
+    let is_inverted_unpk =
+        text.starts_with('u') && text.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("unpk-"));
+    let is_inverted_1z = text.starts_with("1z");
 
-    if is_inverted_afnlf || is_inverted_hr {
+    if is_inverted_afnlf || is_inverted_hr || is_inverted_unpk || is_inverted_1z {
         flip_case(text)
     } else {
         text.to_string()
@@ -57,7 +68,7 @@ pub fn normalize_caps_lock(text: &str) -> String {
 }
 
 /// Normalizes Caps Lock inversion and classifies the scanned payload using
-/// the exact 4-route priority matrix from `SPEC.md` §5.4.
+/// the route priority matrix.
 pub fn classify_scan(raw_text: &str) -> ScanRoute {
     let normalized = normalize_caps_lock(raw_text);
     let mut sections = normalized.split('|');
@@ -81,6 +92,15 @@ pub fn classify_scan(raw_text: &str) -> ScanRoute {
         ScanRoute::CustomerPacked {
             payload: normalized,
             rma,
+        }
+    } else if let Some(after_prefix) = normalized.strip_prefix("UNPK-") {
+        ScanRoute::Unpacked {
+            content: after_prefix.to_owned(),
+            payload: normalized,
+        }
+    } else if normalized.starts_with("1Z") {
+        ScanRoute::UpsTracking {
+            payload: normalized,
         }
     } else {
         ScanRoute::Unrecognized {
@@ -195,5 +215,47 @@ mod tests {
         assert_eq!(normalize_caps_lock("aFNLF|x"), "Afnlf|X");
         // Prefix starting with uppercase 'A' is NOT flipped even if remaining letters are lowercase
         assert_eq!(normalize_caps_lock("Afnlf|x"), "Afnlf|x");
+    }
+
+    #[test]
+    fn unpk_and_1z_routing_and_caps_lock_inversion() {
+        assert_eq!(
+            classify_scan("UNPK-ABC-123"),
+            ScanRoute::Unpacked {
+                payload: "UNPK-ABC-123".to_string(),
+                content: "ABC-123".to_string(),
+            }
+        );
+
+        assert_eq!(
+            classify_scan("unpk-aBc-123"),
+            ScanRoute::Unpacked {
+                payload: "UNPK-AbC-123".to_string(),
+                content: "AbC-123".to_string(),
+            }
+        );
+
+        assert_eq!(
+            classify_scan("1Z12E33Y3451233145"),
+            ScanRoute::UpsTracking {
+                payload: "1Z12E33Y3451233145".to_string(),
+            }
+        );
+
+        assert_eq!(
+            classify_scan("1z12e33y3451233145"),
+            ScanRoute::UpsTracking {
+                payload: "1Z12E33Y3451233145".to_string(),
+            }
+        );
+
+        // Already uppercase "1Z" preserves mixed trailing case
+        assert_eq!(normalize_caps_lock("1ZAbC"), "1ZAbC");
+        assert_eq!(
+            classify_scan("12345"),
+            ScanRoute::Unrecognized {
+                payload: "12345".to_string(),
+            }
+        );
     }
 }

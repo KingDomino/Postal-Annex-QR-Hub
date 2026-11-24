@@ -252,31 +252,40 @@ pub fn print_label_gdi(job: &PrintJob, config: &AppConfig) -> Result<(), String>
         ));
     }
 
-    // Create bold uppercase sans-serif header font if needed and measure its exact pixel height.
+    // Create bold uppercase sans-serif header font if needed and measure its exact pixel height,
+    // scaling down gracefully if a long payload header (e.g. 1Z tracking / UNPK) exceeds 90% width.
     let font_face = to_wide_null("Segoe UI");
-    let font_height = -mul_div_i32(26, metrics.dpi_y.max(72), 72);
-    let header_font = unsafe {
-        CreateFontW(
-            font_height,
-            0,
-            0,
-            0,
-            FW_BOLD.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            DEFAULT_QUALITY.0 as u32,
-            (VARIABLE_PITCH.0 | FF_SWISS.0) as u32,
-            PCWSTR(font_face.as_ptr()),
-        )
+    let dpi_y = metrics.dpi_y.max(72);
+    let create_header_font = |height_px: i32| -> Result<windows::Win32::Graphics::Gdi::HFONT, String> {
+        let font = unsafe {
+            CreateFontW(
+                height_px,
+                0,
+                0,
+                0,
+                FW_BOLD.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_TT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                DEFAULT_QUALITY.0 as u32,
+                (VARIABLE_PITCH.0 | FF_SWISS.0) as u32,
+                PCWSTR(font_face.as_ptr()),
+            )
+        };
+        if font.0.is_null() {
+            Err("Failed to create Win32 header font.".to_string())
+        } else {
+            Ok(font)
+        }
     };
-    if header_font.0.is_null() {
-        return Err("Failed to create Win32 header font.".to_string());
-    }
+
+    let mut font_height = -mul_div_i32(26, dpi_y, 72);
+    let header_font = create_header_font(font_height)?;
     let _font_guard = GdiObjectGuard(HGDIOBJ(header_font.0));
+    let mut _scaled_font_guard: Option<GdiObjectGuard> = None;
 
     let prev_font = unsafe { SelectObject(hdc, HGDIOBJ(header_font.0)) };
     let _selected_font_guard = SelectedObjectGuard {
@@ -295,7 +304,22 @@ pub fn print_label_gdi(job: &PrintJob, config: &AppConfig) -> Result<(), String>
         let ok = unsafe {
             GetTextExtentPoint32W(hdc, &header_wide[..char_count], &mut sz).as_bool()
         };
-        if ok && sz.cy > 0 {
+        let max_header_w = ((metrics.physical_width.max(1) as f32) * 0.90).round() as i32;
+        if ok && sz.cx > max_header_w && max_header_w > 0 {
+            let scaled_pt = ((26.0 * max_header_w as f32) / sz.cx as f32)
+                .floor()
+                .clamp(10.0, 26.0) as i32;
+            if scaled_pt < 26 {
+                font_height = -mul_div_i32(scaled_pt, dpi_y, 72);
+                let scaled_font = create_header_font(font_height)?;
+                _scaled_font_guard = Some(GdiObjectGuard(HGDIOBJ(scaled_font.0)));
+                unsafe {
+                    let _ = SelectObject(hdc, HGDIOBJ(scaled_font.0));
+                    let _ = GetTextExtentPoint32W(hdc, &header_wide[..char_count], &mut sz);
+                }
+            }
+        }
+        if sz.cy > 0 {
             sz.cy
         } else {
             font_height.abs()

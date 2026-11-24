@@ -18,11 +18,29 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Embedded release notes for the current version, used as an offline fallback for "What's New?".
 pub const CURRENT_CHANGELOG: &str = "\
+- Statically linked the Windows C runtime to fix startup errors on clean Windows and ARM64 machines\n\
+- Updated \"What's New?\" to show all unread release changelogs with separate headers per version when skipping updates\n\
+- Updated Happy Returns printed label header to \"UPS Happy Returns\"\n\
+- Added support for \"UNPK-\" QR codes (prints and copies content after \"-\", while encoding the full QR code)\n\
+- Added support for \"1Z\" UPS tracking QR codes (prints and copies full code immediately with Caps Lock correction)";
+
+const CHANGELOG_2_0_2: &str = "\
 - Added a \"What's New?\" dialog that will pop up after updates\n\
 - Added a button in the footer that allows you to report issues with the app\n\
 - Changed window decorations to make the app more seamless\n\
 - Changed the name of the app executable to QR Hub\n\
 - Changed codebase to be more coherent";
+
+/// Embedded release notes by version (newest first), used offline and when a release tag is not yet published.
+pub const EMBEDDED_CHANGELOGS: &[(&str, &str)] =
+    &[("2.0.3", CURRENT_CHANGELOG), ("2.0.2", CHANGELOG_2_0_2)];
+
+/// A single version's changelog section shown inside the "What's New?" dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionChangelog {
+    pub version: String,
+    pub notes: String,
+}
 
 /// Release asset filename for Windows x86_64 builds.
 pub const ASSET_X64: &str = "QR-Hub-windows-x64.exe";
@@ -210,6 +228,89 @@ fn load_cached_changelog_from(path: &Path, version: &str) -> Option<String> {
     }
 }
 
+/// Filters and orders changelogs for versions in `(last_seen, current]`, newest first.
+///
+/// Earlier entries in `available` take precedence when multiple entries exist for the same version.
+/// When `last_seen` is `None` (e.g. upgrading from v2.0.1 or earlier), `2.0.1` is used as the
+/// baseline so skipped `2.0.2`+ notes are all surfaced. If no unread entries match, falls back to
+/// the single entry for `current`.
+pub fn select_unread_changelogs(
+    last_seen: Option<&str>,
+    current: &str,
+    available: Vec<VersionChangelog>,
+) -> Vec<VersionChangelog> {
+    let current_clean = strip_v_prefix(current);
+    let Ok(current_ver) = Version::parse(current_clean) else {
+        return vec![VersionChangelog {
+            version: current_clean.to_string(),
+            notes: CURRENT_CHANGELOG.to_string(),
+        }];
+    };
+
+    let since_ver = last_seen
+        .and_then(|s| Version::parse(strip_v_prefix(s)).ok())
+        .unwrap_or_else(|| Version::new(2, 0, 1));
+
+    let mut deduped: Vec<(Version, VersionChangelog)> = Vec::new();
+    for entry in available {
+        let trimmed_notes = entry.notes.trim();
+        if trimmed_notes.is_empty() {
+            continue;
+        }
+        let Ok(ver) = Version::parse(strip_v_prefix(&entry.version)) else {
+            continue;
+        };
+        if !deduped.iter().any(|(existing_ver, _)| existing_ver == &ver) {
+            let ver_str = ver.to_string();
+            deduped.push((
+                ver,
+                VersionChangelog {
+                    version: ver_str,
+                    notes: trimmed_notes.to_string(),
+                },
+            ));
+        }
+    }
+
+    let mut unread: Vec<(Version, VersionChangelog)> = deduped
+        .iter()
+        .filter(|(ver, _)| ver > &since_ver && ver <= &current_ver)
+        .cloned()
+        .collect();
+    unread.sort_by(|a, b| b.0.cmp(&a.0));
+
+    if !unread.is_empty() {
+        return unread.into_iter().map(|(_, entry)| entry).collect();
+    }
+
+    if let Some((_, current_entry)) = deduped.into_iter().find(|(ver, _)| ver == &current_ver) {
+        return vec![current_entry];
+    }
+
+    vec![VersionChangelog {
+        version: current_ver.to_string(),
+        notes: CURRENT_CHANGELOG.to_string(),
+    }]
+}
+
+/// Builds the initial offline/cached list of unread changelogs from `last_seen` up to `current`.
+pub fn initial_unread_changelogs(last_seen: Option<&str>, current: &str) -> Vec<VersionChangelog> {
+    let mut candidates = Vec::new();
+    if let Some(cached) = load_cached_changelog(current) {
+        candidates.push(VersionChangelog {
+            version: strip_v_prefix(current).to_string(),
+            notes: cached,
+        });
+    }
+    for &(ver, notes) in EMBEDDED_CHANGELOGS {
+        candidates.push(VersionChangelog {
+            version: ver.to_string(),
+            notes: notes.to_string(),
+        });
+    }
+    select_unread_changelogs(last_seen, current, candidates)
+}
+
 /// Metadata for a newer release ready to be downloaded and installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableUpdate {
@@ -232,7 +333,8 @@ pub enum UpdateCommand {
     Install(AvailableUpdate),
     FetchChangelog {
         repo: String,
-        version: String,
+        since_version: Option<String>,
+        current_version: String,
     },
 }
 
@@ -245,7 +347,7 @@ pub enum UpdateEvent {
     DownloadProgress { downloaded: u64, total: Option<u64> },
     Verifying,
     ReadyToRestart,
-    ChangelogLoaded { version: String, notes: String },
+    ChangelogsLoaded(Vec<VersionChangelog>),
     Error { message: String, silent: bool },
 }
 
@@ -294,8 +396,17 @@ impl UpdateWorker {
                         UpdateCommand::Install(update) => {
                             run_install(&update, &emit);
                         }
-                        UpdateCommand::FetchChangelog { repo, version } => {
-                            run_fetch_changelog(&repo, &version, &emit);
+                        UpdateCommand::FetchChangelog {
+                            repo,
+                            since_version,
+                            current_version,
+                        } => {
+                            run_fetch_changelog(
+                                &repo,
+                                since_version.as_deref(),
+                                &current_version,
+                                &emit,
+                            );
                         }
                     }
                 }
@@ -322,11 +433,18 @@ impl UpdateWorker {
         let _ = self.tx.send(UpdateCommand::Install(update));
     }
 
-    /// Fetches live release notes for `version` from GitHub Releases (silent on offline/errors).
-    pub fn fetch_changelog(&self, repo: String, version: String) {
-        let _ = self
-            .tx
-            .send(UpdateCommand::FetchChangelog { repo, version });
+    /// Fetches live release notes for all unread releases between `since_version` and `current_version`.
+    pub fn fetch_changelog(
+        &self,
+        repo: String,
+        since_version: Option<String>,
+        current_version: String,
+    ) {
+        let _ = self.tx.send(UpdateCommand::FetchChangelog {
+            repo,
+            since_version,
+            current_version,
+        });
     }
 
     /// Non-blocking poll for the next [`UpdateEvent`].
@@ -657,10 +775,15 @@ fn run_install(update: &AvailableUpdate, emit: &dyn Fn(UpdateEvent) -> bool) {
 }
 
 #[cfg(feature = "online-updater")]
-fn run_fetch_changelog(repo: &str, version: &str, emit: &dyn Fn(UpdateEvent) -> bool) {
+fn run_fetch_changelog(
+    repo: &str,
+    since_version: Option<&str>,
+    current_version: &str,
+    emit: &dyn Fn(UpdateEvent) -> bool,
+) {
     let repo_trimmed = repo.trim().trim_end_matches('/');
-    let ver = strip_v_prefix(version);
-    if repo_trimmed.is_empty() || ver.is_empty() {
+    let cur = strip_v_prefix(current_version);
+    if repo_trimmed.is_empty() || cur.is_empty() {
         return;
     }
 
@@ -672,7 +795,7 @@ fn run_fetch_changelog(repo: &str, version: &str, emit: &dyn Fn(UpdateEvent) -> 
         return;
     };
 
-    let url = format!("https://api.github.com/repos/{repo_trimmed}/releases/tags/v{ver}");
+    let url = format!("https://api.github.com/repos/{repo_trimmed}/releases?per_page=20");
     let Ok(resp) = client.get(&url).send() else {
         return;
     };
@@ -681,24 +804,57 @@ fn run_fetch_changelog(repo: &str, version: &str, emit: &dyn Fn(UpdateEvent) -> 
     }
 
     #[derive(Deserialize)]
-    struct ReleaseNotesPayload {
+    struct ReleaseListItem {
+        tag_name: String,
         body: Option<String>,
+        #[serde(default)]
+        draft: bool,
     }
 
-    let Ok(payload) = resp.json::<ReleaseNotesPayload>() else {
+    let Ok(releases) = resp.json::<Vec<ReleaseListItem>>() else {
         return;
     };
 
-    if let Some(notes) = payload
-        .body
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let _ = emit(UpdateEvent::ChangelogLoaded {
+    let mut candidates = Vec::new();
+    for item in releases {
+        if item.draft {
+            continue;
+        }
+        if let Some(notes) = item
+            .body
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            candidates.push(VersionChangelog {
+                version: strip_v_prefix(&item.tag_name).to_string(),
+                notes: notes.to_string(),
+            });
+        }
+    }
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Include cached/embedded notes after live GitHub notes so any local/untagged current
+    // release stays included while published GitHub release notes take priority.
+    if let Some(cached) = load_cached_changelog(cur) {
+        candidates.push(VersionChangelog {
+            version: cur.to_string(),
+            notes: cached,
+        });
+    }
+    for &(ver, notes) in EMBEDDED_CHANGELOGS {
+        candidates.push(VersionChangelog {
             version: ver.to_string(),
             notes: notes.to_string(),
         });
+    }
+
+    let selected = select_unread_changelogs(since_version, cur, candidates);
+    if !selected.is_empty() {
+        let _ = emit(UpdateEvent::ChangelogsLoaded(selected));
     }
 }
 
@@ -719,7 +875,13 @@ fn run_install(_update: &AvailableUpdate, emit: &dyn Fn(UpdateEvent) -> bool) {
 }
 
 #[cfg(not(feature = "online-updater"))]
-fn run_fetch_changelog(_repo: &str, _version: &str, _emit: &dyn Fn(UpdateEvent) -> bool) {}
+fn run_fetch_changelog(
+    _repo: &str,
+    _since_version: Option<&str>,
+    _current_version: &str,
+    _emit: &dyn Fn(UpdateEvent) -> bool,
+) {
+}
 
 #[cfg(test)]
 mod tests {
@@ -759,7 +921,63 @@ mod tests {
     #[test]
     fn current_changelog_is_populated() {
         assert!(CURRENT_CHANGELOG.contains("What's New?"));
-        assert!(CURRENT_CHANGELOG.contains("QR Hub"));
+        assert!(CURRENT_CHANGELOG.contains("UPS Happy Returns"));
+        assert!(CURRENT_CHANGELOG.contains("UNPK-"));
+        assert!(CURRENT_CHANGELOG.contains("1Z"));
+    }
+
+    #[test]
+    fn select_unread_changelogs_combines_skipped_versions_newest_first() {
+        let releases = vec![
+            VersionChangelog {
+                version: "v2.0.3".to_string(),
+                notes: "- 2.0.3 live notes".to_string(),
+            },
+            VersionChangelog {
+                version: "2.0.3".to_string(),
+                notes: "- 2.0.3 duplicate should lose".to_string(),
+            },
+            VersionChangelog {
+                version: "2.0.2".to_string(),
+                notes: "- 2.0.2 live notes".to_string(),
+            },
+            VersionChangelog {
+                version: "2.0.1".to_string(),
+                notes: "- 2.0.1 older notes".to_string(),
+            },
+        ];
+
+        // Skipping v2.0.2 (2.0.1 -> 2.0.3) returns both 2.0.3 and 2.0.2 newest-first
+        let skipped = select_unread_changelogs(Some("2.0.1"), "2.0.3", releases.clone());
+        assert_eq!(
+            skipped,
+            vec![
+                VersionChangelog {
+                    version: "2.0.3".to_string(),
+                    notes: "- 2.0.3 live notes".to_string(),
+                },
+                VersionChangelog {
+                    version: "2.0.2".to_string(),
+                    notes: "- 2.0.2 live notes".to_string(),
+                },
+            ]
+        );
+
+        // Missing last_seen_version (upgrading from pre-2.0.2 install) also returns 2.0.3 + 2.0.2
+        let legacy = select_unread_changelogs(None, "2.0.3", releases.clone());
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(legacy[0].version, "2.0.3");
+        assert_eq!(legacy[1].version, "2.0.2");
+
+        // Stepping 2.0.2 -> 2.0.3 shows only 2.0.3
+        let single = select_unread_changelogs(Some("2.0.2"), "2.0.3", releases.clone());
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].version, "2.0.3");
+
+        // Reopening manually on same version falls back to current version's notes
+        let manual = select_unread_changelogs(Some("2.0.3"), "2.0.3", releases);
+        assert_eq!(manual.len(), 1);
+        assert_eq!(manual[0].version, "2.0.3");
     }
 
     #[test]
