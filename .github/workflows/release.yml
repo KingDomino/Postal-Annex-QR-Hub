@@ -19,11 +19,13 @@ jobs:
           - arch_label: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset_name: PostalAnnexQRScanner-windows-x64.exe
+            asset_name: QR-Hub-windows-x64.exe
+            legacy_asset_name: PostalAnnexQRScanner-windows-x64.exe
           - arch_label: windows-arm64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            asset_name: PostalAnnexQRScanner-windows-arm64.exe
+            asset_name: QR-Hub-windows-arm64.exe
+            legacy_asset_name: PostalAnnexQRScanner-windows-arm64.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -51,13 +53,14 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target\${{ matrix.target }}\release\PostalAnnexQRScanner.exe" "dist\${{ matrix.asset_name }}"
+          Copy-Item "target\${{ matrix.target }}\release\QR-Hub.exe" "dist\${{ matrix.asset_name }}"
+          Copy-Item "target\${{ matrix.target }}\release\QR-Hub.exe" "dist\${{ matrix.legacy_asset_name }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.arch_label }}
-          path: dist/${{ matrix.asset_name }}
+          path: dist/*.exe
           if-no-files-found: error
 
   publish:
@@ -76,6 +79,8 @@ jobs:
         working-directory: release-artifacts
         run: |
           sha256sum \
+            QR-Hub-windows-x64.exe \
+            QR-Hub-windows-arm64.exe \
             PostalAnnexQRScanner-windows-x64.exe \
             PostalAnnexQRScanner-windows-arm64.exe \
             > checksums.txt
@@ -93,6 +98,8 @@ jobs:
         with:
           generate_release_notes: true
           files: |
+            release-artifacts/QR-Hub-windows-x64.exe
+            release-artifacts/QR-Hub-windows-arm64.exe
             release-artifacts/PostalAnnexQRScanner-windows-x64.exe
             release-artifacts/PostalAnnexQRScanner-windows-arm64.exe
             release-artifacts/checksums.txt

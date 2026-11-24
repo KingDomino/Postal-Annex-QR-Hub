@@ -87,7 +87,7 @@ pub fn module_state(
     scan_nonce: u64,
     elapsed_secs: f32,
 ) -> ModuleAnimState {
-    if elapsed_secs >= TOTAL_DURATION_SECS {
+    if QrAnimation::is_finished_elapsed(elapsed_secs) {
         return ModuleAnimState {
             scale: 1.0,
             offset_x_px: 0.0,

@@ -3,8 +3,8 @@
 use std::time::Instant;
 
 use eframe::egui::{
-    self, Align, Color32, ComboBox, CornerRadius, DragValue, Frame, Id, Label, Layout, Margin,
-    Modal, ProgressBar, RichText, ScrollArea, Shadow, Slider, Spinner, Stroke, TextEdit, Ui,
+    self, Align, Color32, ComboBox, DragValue, Id, Label, Layout, Modal, ProgressBar, RichText,
+    ScrollArea, Slider, Spinner, TextEdit, Ui,
 };
 
 use postal_annex_qr_scanner::config::AppConfig;
@@ -15,34 +15,21 @@ use super::app::{ScannerApp, TestPrintStatus, UpdatePhase};
 use super::colors::*;
 use super::{
     close_icon_button, flat_button, font_bold, font_regular, font_semibold, format_bytes,
-    text_button_width, ButtonStyle,
+    modal_frame, secondary_button_style, text_button_width, ButtonStyle, MODAL_WIDTH,
 };
-
-const MODAL_WIDTH: f32 = 390.0;
 
 /// Renders the centered Settings modal over a click-blocking backdrop scrim.
 pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context, now: Instant) {
     let mut should_close = false;
+    let mut open_whats_new = false;
     let mut config_changed_discrete = false;
     let mut config_changed_continuous = false;
 
     let max_body_height = (ctx.screen_rect().height() - 150.0).clamp(180.0, 520.0);
 
-    let modal_frame = Frame::new()
-        .fill(WHITE)
-        .stroke(Stroke::new(1.0_f32, CARD_STROKE))
-        .corner_radius(CornerRadius::same(12))
-        .shadow(Shadow {
-            offset: [0, 8],
-            blur: 24,
-            spread: 0,
-            color: Color32::from_black_alpha(64),
-        })
-        .inner_margin(Margin::same(20));
-
     let modal_response = Modal::new(Id::new("settings_modal"))
         .backdrop_color(Color32::from_black_alpha(110))
-        .frame(modal_frame)
+        .frame(modal_frame())
         .show(ctx, |ui| {
             ui.set_width(MODAL_WIDTH - 40.0);
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
@@ -98,6 +85,7 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context, now: Instant) {
                         ui,
                         &mut config_changed_discrete,
                         &mut config_changed_continuous,
+                        &mut open_whats_new,
                     );
 
                     ui.add_space(4.0);
@@ -144,7 +132,10 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context, now: Instant) {
         app.config_dirty_at = Some(now);
     }
 
-    if should_close || modal_response.should_close() {
+    if open_whats_new {
+        app.close_settings();
+        app.open_whats_new();
+    } else if should_close || modal_response.should_close() {
         app.close_settings();
     }
 }
@@ -210,7 +201,7 @@ fn printer_section(app: &mut ScannerApp, ui: &mut Ui, changed: &mut bool) {
                 }
             });
 
-        let style = ButtonStyle::solid(GRAY_200, GRAY_300, TEXT_BODY).with_stroke(GRAY_400);
+        let style = secondary_button_style();
         if flat_button(
             ui,
             egui::vec2(refresh_w, 26.0),
@@ -401,13 +392,12 @@ fn calibration_section(
 
     let reset_font = font_semibold(12.5);
     let reset_w = text_button_width(ui, "Reset Calibration", reset_font.clone(), 12.0);
-    let reset_style = ButtonStyle::solid(GRAY_200, GRAY_300, TEXT_BODY).with_stroke(GRAY_400);
     if flat_button(
         ui,
         egui::vec2(reset_w, 28.0),
         "Reset Calibration",
         reset_font,
-        reset_style,
+        secondary_button_style(),
     )
     .clicked()
     {
@@ -421,6 +411,7 @@ fn updates_section(
     ui: &mut Ui,
     changed_discrete: &mut bool,
     changed_continuous: &mut bool,
+    open_whats_new: &mut bool,
 ) {
     section_heading(ui, "UPDATES & INFO");
 
@@ -474,20 +465,19 @@ fn updates_section(
     );
 
     ui.horizontal(|ui| {
-        let check_font = font_semibold(12.5);
+        let btn_font = font_semibold(12.5);
         let check_label = if app.update_phase == UpdatePhase::Checking {
             "Checking\u{2026}"
         } else {
             "Check for Updates"
         };
-        let check_w = text_button_width(ui, "Check for Updates", check_font.clone(), 12.0);
-        let check_style = ButtonStyle::solid(GRAY_200, GRAY_300, TEXT_BODY).with_stroke(GRAY_400);
+        let check_w = text_button_width(ui, "Check for Updates", btn_font.clone(), 12.0);
         if flat_button(
             ui,
             egui::vec2(check_w, 30.0),
             check_label,
-            check_font,
-            check_style,
+            btn_font.clone(),
+            secondary_button_style(),
         )
         .clicked()
             && !busy
@@ -495,25 +485,38 @@ fn updates_section(
             app.check_for_updates();
         }
 
-        if app.available_update.is_some()
-            && !app.installing_update
-            && app.update_phase != UpdatePhase::ReadyToRestart
+        let whats_new_w = text_button_width(ui, "What's New?", btn_font.clone(), 12.0);
+        if flat_button(
+            ui,
+            egui::vec2(whats_new_w, 30.0),
+            "What's New?",
+            btn_font,
+            secondary_button_style(),
+        )
+        .clicked()
         {
-            let install_font = font_bold(12.5);
-            let install_w = text_button_width(ui, "Update & Restart", install_font.clone(), 12.0);
-            if flat_button(
-                ui,
-                egui::vec2(install_w, 30.0),
-                "Update & Restart",
-                install_font,
-                ButtonStyle::solid(NAVY, NAVY_HOVER, WHITE),
-            )
-            .clicked()
-            {
-                app.start_update_install();
-            }
+            *open_whats_new = true;
         }
     });
+
+    if app.available_update.is_some()
+        && !app.installing_update
+        && app.update_phase != UpdatePhase::ReadyToRestart
+    {
+        let install_font = font_bold(12.5);
+        let install_w = text_button_width(ui, "Update & Restart", install_font.clone(), 14.0);
+        if flat_button(
+            ui,
+            egui::vec2(install_w, 30.0),
+            "Update & Restart",
+            install_font,
+            ButtonStyle::solid(NAVY, NAVY_HOVER, WHITE),
+        )
+        .clicked()
+        {
+            app.start_update_install();
+        }
+    }
 
     match &app.update_phase {
         UpdatePhase::Idle => {}
@@ -628,7 +631,7 @@ fn updates_section(
     if cfg!(windows) {
         let location_text = installer::install_dir()
             .map(|p| format!("Install folder: {}", p.display()))
-            .unwrap_or_else(|| "Install folder: %LOCALAPPDATA%\\PostalAnnexQRScanner".to_string());
+            .unwrap_or_else(|| "Install folder: %LOCALAPPDATA%\\QR Hub".to_string());
         ui.add(
             Label::new(
                 RichText::new(location_text)
@@ -642,7 +645,7 @@ fn updates_section(
 
     ui.horizontal(|ui| {
         let btn_font = font_semibold(12.0);
-        let btn_style = ButtonStyle::solid(GRAY_200, GRAY_300, TEXT_BODY).with_stroke(GRAY_400);
+        let btn_style = secondary_button_style();
 
         let desktop_w = text_button_width(ui, "Add Desktop Shortcut", btn_font.clone(), 10.0);
         if flat_button(

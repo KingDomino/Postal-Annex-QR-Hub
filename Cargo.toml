@@ -1,15 +1,15 @@
 [package]
 name = "postal-annex-qr-scanner"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
-description = "PostalAnnex+ Amazon QR Code Scanner"
+description = "QR Hub — PostalAnnex+ Amazon QR Code Scanner"
 
 [lib]
 name = "postal_annex_qr_scanner"
 path = "src/lib.rs"
 
 [[bin]]
-name = "PostalAnnexQRScanner"
+name = "QR-Hub"
 path = "src/main.rs"
 
 [features]

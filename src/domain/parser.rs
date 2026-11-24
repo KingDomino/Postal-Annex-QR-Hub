@@ -28,13 +28,9 @@ pub fn flip_case(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         if ch.is_uppercase() {
-            for lc in ch.to_lowercase() {
-                out.push(lc);
-            }
+            out.extend(ch.to_lowercase());
         } else if ch.is_lowercase() {
-            for uc in ch.to_uppercase() {
-                out.push(uc);
-            }
+            out.extend(ch.to_uppercase());
         } else {
             out.push(ch);
         }
@@ -42,16 +38,18 @@ pub fn flip_case(input: &str) -> String {
     out
 }
 
-/// Applies the pattern-based Caps Lock correction rule from `app.html`.
+/// Applies the pattern-based Caps Lock correction rule for known return prefixes.
 ///
 /// If the text starts with a case-insensitive known prefix (`afnlf` or `hr`) AND
 /// its first character is lowercase (`a` or `h`), Caps Lock was inverted on the
 /// scanner/workstation, so every character's case is individually inverted via [`flip_case`].
 pub fn normalize_caps_lock(text: &str) -> String {
-    let lower = text.to_lowercase();
-    if (lower.starts_with("afnlf") || lower.starts_with("hr"))
-        && (text.starts_with('a') || text.starts_with('h'))
-    {
+    let is_inverted_afnlf =
+        text.starts_with('a') && text.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("afnlf"));
+    let is_inverted_hr =
+        text.starts_with('h') && text.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("hr"));
+
+    if is_inverted_afnlf || is_inverted_hr {
         flip_case(text)
     } else {
         text.to_string()

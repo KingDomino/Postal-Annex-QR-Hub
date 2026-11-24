@@ -23,14 +23,17 @@ use postal_annex_qr_scanner::qr::{
     animation::{self, QrAnimation},
     QrMatrix, QUIET_ZONE_MODULES,
 };
-use postal_annex_qr_scanner::updater::{AvailableUpdate, UpdateEvent, UpdateWorker};
+use postal_annex_qr_scanner::updater::{
+    self, AvailableUpdate, UpdateEvent, UpdateWorker, CURRENT_VERSION,
+};
 
 use super::colors::*;
 use super::{
-    blink_phase, boxed, card_width, close_icon_button, flat_button, font_bold, font_bold_italic,
-    font_mono, font_regular, font_semibold, install_theme, overlay_button, paint_dashed_rule,
-    paint_gear, settings, snap_to_pixel, text_button_width, text_format, ButtonStyle, FontSupport,
-    COPIED_FEEDBACK, CONFIG_SAVE_DEBOUNCE, QR_PREVIEW_SIZE,
+    blink_phase, boxed, card_width, chrome, close_icon_button, flat_button, font_bold,
+    font_bold_italic, font_mono, font_regular, font_semibold, install_theme, overlay_button,
+    paint_dashed_rule, paint_gear, secondary_button_style, settings, snap_to_pixel,
+    text_button_width, text_format, whats_new, ButtonStyle, FontSupport, COPIED_FEEDBACK,
+    CONFIG_SAVE_DEBOUNCE, QR_PREVIEW_SIZE,
 };
 
 const HAPPY_RETURN_QUESTION: &str =
@@ -127,6 +130,8 @@ pub struct ScannerApp {
     pending_prints: VecDeque<PrintOrigin>,
 
     pub(super) settings_open: bool,
+    pub(super) whats_new_open: bool,
+    pub(super) whats_new_notes: String,
     pub(super) printers: Vec<String>,
     pub(super) printers_refreshing: bool,
     pub(super) printers_error: Option<String>,
@@ -148,10 +153,27 @@ pub struct ScannerApp {
 
 impl ScannerApp {
     /// Builds the app: theme + fonts, config, background print/update workers.
-    pub fn new(cc: &eframe::CreationContext<'_>, just_installed: bool) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        just_installed: bool,
+        just_updated: bool,
+    ) -> Self {
         let ctx = cc.egui_ctx.clone();
         let fonts = install_theme(&ctx);
-        let config = AppConfig::load();
+        let (mut config, had_existing_config) = AppConfig::load_with_existing_flag();
+
+        let auto_open_whats_new = should_auto_open_whats_new(
+            just_updated,
+            had_existing_config,
+            config.last_seen_version.as_deref(),
+            CURRENT_VERSION,
+        );
+        if config.last_seen_version.as_deref() != Some(CURRENT_VERSION) {
+            config.last_seen_version = Some(CURRENT_VERSION.to_string());
+            let _ = config.save();
+        }
+
+        let whats_new_notes = initial_changelog_notes();
 
         let repaint_ctx = ctx.clone();
         let repaint_cb: Arc<dyn Fn() + Send + Sync> = Arc::new(move || repaint_ctx.request_repaint());
@@ -161,6 +183,9 @@ impl ScannerApp {
         print_worker.refresh_printers();
         if config.auto_check_updates {
             update_worker.check(config.github_repo.clone(), true, Some(Duration::from_secs(1)));
+        }
+        if auto_open_whats_new {
+            update_worker.fetch_changelog(config.github_repo.clone(), CURRENT_VERSION.to_string());
         }
 
         Self {
@@ -175,6 +200,8 @@ impl ScannerApp {
             screen_changed_at: Instant::now(),
             pending_prints: VecDeque::new(),
             settings_open: false,
+            whats_new_open: auto_open_whats_new,
+            whats_new_notes,
             printers: Vec::new(),
             printers_refreshing: true,
             printers_error: None,
@@ -194,10 +221,15 @@ impl ScannerApp {
     }
 
     // -----------------------------------------------------------------------
-    // Actions shared with the Settings modal
+    // Actions shared with modal overlays
     // -----------------------------------------------------------------------
 
+    fn is_modal_open(&self) -> bool {
+        self.settings_open || self.whats_new_open
+    }
+
     pub(super) fn open_settings(&mut self) {
+        self.whats_new_open = false;
         self.settings_open = true;
         self.scan_buffer.clear();
         self.test_print = TestPrintStatus::Idle;
@@ -210,6 +242,22 @@ impl ScannerApp {
         self.settings_open = false;
         self.scan_buffer.clear();
         self.save_config_now();
+    }
+
+    pub(super) fn open_whats_new(&mut self) {
+        self.settings_open = false;
+        self.whats_new_open = true;
+        self.scan_buffer.clear();
+        self.whats_new_notes = initial_changelog_notes();
+        self.update_worker.fetch_changelog(
+            self.config.github_repo.trim().to_string(),
+            CURRENT_VERSION.to_string(),
+        );
+    }
+
+    pub(super) fn close_whats_new(&mut self) {
+        self.whats_new_open = false;
+        self.scan_buffer.clear();
     }
 
     pub(super) fn request_printer_refresh(&mut self) {
@@ -326,6 +374,13 @@ impl ScannerApp {
                 self.update_phase = UpdatePhase::ReadyToRestart;
                 self.save_config_now();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            UpdateEvent::ChangelogLoaded { version, notes } => {
+                let normalized = version.trim().trim_start_matches(['v', 'V']);
+                if normalized == CURRENT_VERSION && !notes.trim().is_empty() {
+                    self.whats_new_notes = notes.clone();
+                    let _ = updater::save_cached_changelog(&version, &notes);
+                }
             }
             UpdateEvent::Error { message, silent } => {
                 if self.installing_update {
@@ -516,29 +571,49 @@ impl ScannerApp {
     // -----------------------------------------------------------------------
 
     fn show_footer(&self, ctx: &egui::Context) {
-        let printer = self
-            .config
-            .active_printer()
-            .map_or_else(|| "No Printer Configured".to_string(), |p| format!("Printer: {p}"));
-        let text = format!(
-            "Amazon Scanner v{}  \u{2022}  {printer}",
-            env!("CARGO_PKG_VERSION")
-        );
+        let text = footer_label(CURRENT_VERSION, self.config.active_printer());
+        let issue_url = updater::issues_url(&self.config.github_repo);
         egui::TopBottomPanel::bottom("version_footer")
             .frame(
                 Frame::new()
                     .fill(WINDOW_BG)
-                    .inner_margin(Margin::symmetric(10, 7)),
+                    .inner_margin(Margin::symmetric(12, 7)),
             )
             .show_separator_line(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add(
-                        Label::new(RichText::new(text).font(font_regular(10.0)).color(FOOTER))
-                            .truncate()
-                            .selectable(false),
-                    );
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let btn_font = font_semibold(10.5);
+                        let btn_w = text_button_width(ui, "Report an Issue", btn_font.clone(), 9.0);
+                        let btn_style = ButtonStyle::solid(GRAY_150, GRAY_300, TEXT_BODY)
+                            .with_stroke(GRAY_400)
+                            .with_radius(10);
+                        if flat_button(
+                            ui,
+                            egui::vec2(btn_w, 20.0),
+                            "Report an Issue",
+                            btn_font,
+                            btn_style,
+                        )
+                        .on_hover_text(issue_url.as_str())
+                        .clicked()
+                        {
+                            ctx.open_url(egui::OpenUrl::new_tab(issue_url.clone()));
+                        }
+
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(
+                                Label::new(
+                                    RichText::new(text)
+                                        .font(font_regular(10.0))
+                                        .color(FOOTER),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                        });
+                    });
                 });
             });
     }
@@ -907,13 +982,12 @@ impl ScannerApp {
                     actions.push(CardAction::CopyAll);
                 }
                 ui.add_space(14.0);
-                let style = ButtonStyle::solid(GRAY_200, GRAY_300, TEXT_BODY).with_stroke(GRAY_400);
                 if flat_button(
                     ui,
                     egui::vec2(ui.available_width(), 38.0),
                     "Reprint Last Label",
                     font_semibold(14.0),
-                    style,
+                    secondary_button_style(),
                 )
                 .clicked()
                 {
@@ -1084,11 +1158,12 @@ impl eframe::App for ScannerApp {
 
         self.poll_workers(ctx);
 
-        if !self.settings_open {
+        if !self.is_modal_open() {
             Self::release_focus(ctx);
             self.capture_scan_input(ctx, now);
         }
 
+        chrome::show(ctx);
         self.show_footer(ctx);
         self.show_banners(ctx);
         self.show_home(ctx, now);
@@ -1096,7 +1171,10 @@ impl eframe::App for ScannerApp {
         if self.settings_open {
             settings::show(self, ctx, now);
         }
-        if !self.settings_open {
+        if self.whats_new_open {
+            whats_new::show(self, ctx);
+        }
+        if !self.is_modal_open() {
             Self::release_focus(ctx);
         }
 
@@ -1108,6 +1186,26 @@ impl eframe::App for ScannerApp {
 // ---------------------------------------------------------------------------
 // Stateless homepage pieces
 // ---------------------------------------------------------------------------
+
+fn initial_changelog_notes() -> String {
+    updater::load_cached_changelog(CURRENT_VERSION)
+        .unwrap_or_else(|| updater::CURRENT_CHANGELOG.to_string())
+}
+
+fn should_auto_open_whats_new(
+    just_updated: bool,
+    had_existing_config: bool,
+    last_seen_version: Option<&str>,
+    current_version: &str,
+) -> bool {
+    just_updated || (had_existing_config && last_seen_version != Some(current_version))
+}
+
+fn footer_label(version: &str, active_printer: Option<&str>) -> String {
+    let printer = active_printer
+        .map_or_else(|| "No Printer Configured".to_string(), |p| format!("Printer: {p}"));
+    format!("QR Hub v{version}  \u{2022}  {printer}")
+}
 
 /// Lays out `add` in a horizontally centered column matching the card width.
 fn centered_column<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
@@ -1429,5 +1527,31 @@ mod tests {
     fn status_pill_label_reflects_generating_state() {
         assert_eq!(status_pill_label(false), "Ready to Scan");
         assert_eq!(status_pill_label(true), "Generating Code");
+    }
+
+    #[test]
+    fn whats_new_auto_opens_only_after_update_or_version_bump_on_existing_install() {
+        // Fresh install without --just-updated should not nag.
+        assert!(!should_auto_open_whats_new(false, false, None, "2.0.2"));
+        // Explicit --just-updated always opens.
+        assert!(should_auto_open_whats_new(true, false, None, "2.0.2"));
+        assert!(should_auto_open_whats_new(true, true, Some("2.0.2"), "2.0.2"));
+        // Existing install upgraded from previous/untracked version opens once.
+        assert!(should_auto_open_whats_new(false, true, None, "2.0.2"));
+        assert!(should_auto_open_whats_new(false, true, Some("2.0.1"), "2.0.2"));
+        // Normal subsequent launch on same version does not reopen.
+        assert!(!should_auto_open_whats_new(false, true, Some("2.0.2"), "2.0.2"));
+    }
+
+    #[test]
+    fn footer_label_uses_qr_hub_branding() {
+        assert_eq!(
+            footer_label("2.0.2", None),
+            "QR Hub v2.0.2  \u{2022}  No Printer Configured"
+        );
+        assert_eq!(
+            footer_label("2.0.2", Some("Zebra ZD421")),
+            "QR Hub v2.0.2  \u{2022}  Printer: Zebra ZD421"
+        );
     }
 }

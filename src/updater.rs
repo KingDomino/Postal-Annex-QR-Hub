@@ -1,24 +1,39 @@
 //! Architecture-aware GitHub Releases auto-updater with SHA-256 verification and self-replace.
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::config::{config_dir, DEFAULT_GITHUB_REPO};
 
 /// Current application version from `Cargo.toml`.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Embedded release notes for the current version, used as an offline fallback for "What's New?".
+pub const CURRENT_CHANGELOG: &str = "\
+- Added a \"What's New?\" dialog that will pop up after updates\n\
+- Added a button in the footer that allows you to report issues with the app\n\
+- Changed window decorations to make the app more seamless\n\
+- Changed the name of the app executable to QR Hub\n\
+- Changed codebase to be more coherent";
+
 /// Release asset filename for Windows x86_64 builds.
-pub const ASSET_X64: &str = "PostalAnnexQRScanner-windows-x64.exe";
+pub const ASSET_X64: &str = "QR-Hub-windows-x64.exe";
 
 /// Release asset filename for Windows ARM64 builds.
-pub const ASSET_ARM64: &str = "PostalAnnexQRScanner-windows-arm64.exe";
+pub const ASSET_ARM64: &str = "QR-Hub-windows-arm64.exe";
 
 /// Combined SHA-256 checksum manifest attached to every GitHub Release.
 pub const CHECKSUMS_ASSET: &str = "checksums.txt";
+
+const CACHED_CHANGELOG_FILENAME: &str = "last-update-notes.json";
 
 /// Release asset filename matching the currently compiled target architecture.
 #[cfg(target_arch = "x86_64")]
@@ -128,6 +143,73 @@ pub fn verify_sha256(bytes: &[u8], expected_hex: &str) -> Result<(), String> {
     }
 }
 
+/// Builds the GitHub Issues URL for `repo`, falling back to [`DEFAULT_GITHUB_REPO`] when empty.
+pub fn issues_url(repo: &str) -> String {
+    let trimmed = repo.trim().trim_end_matches('/');
+    let cleaned = if trimmed.is_empty() {
+        DEFAULT_GITHUB_REPO
+    } else {
+        trimmed
+    };
+    format!("https://github.com/{cleaned}/issues")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CachedChangelog {
+    version: String,
+    notes: String,
+}
+
+/// Returns the path where cached update release notes are stored (`%APPDATA%\QR Hub\last-update-notes.json`).
+pub fn cached_changelog_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join(CACHED_CHANGELOG_FILENAME))
+}
+
+/// Persists release notes for `version` to the default cached changelog path.
+pub fn save_cached_changelog(version: &str, notes: &str) -> Result<(), String> {
+    let path = cached_changelog_path()
+        .ok_or_else(|| "Could not determine user configuration directory".to_string())?;
+    save_cached_changelog_to(&path, version, notes)
+}
+
+/// Loads cached release notes for `version` from the default cached changelog path, if they match.
+pub fn load_cached_changelog(version: &str) -> Option<String> {
+    let path = cached_changelog_path()?;
+    load_cached_changelog_from(&path, version)
+}
+
+fn save_cached_changelog_to(path: &Path, version: &str, notes: &str) -> Result<(), String> {
+    let trimmed_notes = notes.trim();
+    if trimmed_notes.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create changelog cache directory: {e}"))?;
+    }
+    let payload = CachedChangelog {
+        version: strip_v_prefix(version).to_string(),
+        notes: trimmed_notes.to_string(),
+    };
+    let json = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("Failed to serialize cached changelog: {e}"))?;
+    fs::write(path, json).map_err(|e| format!("Failed to write cached changelog: {e}"))
+}
+
+fn load_cached_changelog_from(path: &Path, version: &str) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let cached: CachedChangelog = serde_json::from_str(&raw).ok()?;
+    if strip_v_prefix(&cached.version) != strip_v_prefix(version) {
+        return None;
+    }
+    let notes = cached.notes.trim();
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.to_string())
+    }
+}
+
 /// Metadata for a newer release ready to be downloaded and installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableUpdate {
@@ -148,6 +230,10 @@ pub enum UpdateCommand {
         initial_delay: Option<Duration>,
     },
     Install(AvailableUpdate),
+    FetchChangelog {
+        repo: String,
+        version: String,
+    },
 }
 
 /// Events emitted by the background [`UpdateWorker`] thread.
@@ -159,6 +245,7 @@ pub enum UpdateEvent {
     DownloadProgress { downloaded: u64, total: Option<u64> },
     Verifying,
     ReadyToRestart,
+    ChangelogLoaded { version: String, notes: String },
     Error { message: String, silent: bool },
 }
 
@@ -207,6 +294,9 @@ impl UpdateWorker {
                         UpdateCommand::Install(update) => {
                             run_install(&update, &emit);
                         }
+                        UpdateCommand::FetchChangelog { repo, version } => {
+                            run_fetch_changelog(&repo, &version, &emit);
+                        }
                     }
                 }
             })
@@ -232,6 +322,13 @@ impl UpdateWorker {
         let _ = self.tx.send(UpdateCommand::Install(update));
     }
 
+    /// Fetches live release notes for `version` from GitHub Releases (silent on offline/errors).
+    pub fn fetch_changelog(&self, repo: String, version: String) {
+        let _ = self
+            .tx
+            .send(UpdateCommand::FetchChangelog { repo, version });
+    }
+
     /// Non-blocking poll for the next [`UpdateEvent`].
     pub fn try_recv(&self) -> Option<UpdateEvent> {
         self.rx.try_recv().ok()
@@ -255,7 +352,7 @@ struct GithubAsset {
 
 #[cfg(feature = "online-updater")]
 fn user_agent() -> String {
-    format!("PostalAnnexQRScanner/{CURRENT_VERSION}")
+    format!("QRHub/{CURRENT_VERSION}")
 }
 
 #[cfg(feature = "online-updater")]
@@ -436,7 +533,7 @@ fn run_install(update: &AvailableUpdate, emit: &dyn Fn(UpdateEvent) -> bool) {
 
     let total = resp.content_length();
     let temp_path = std::env::temp_dir().join(format!(
-        "PostalAnnexQRScanner-update-{}-{}.exe",
+        "QR-Hub-update-{}-{}.exe",
         std::process::id(),
         update.version.replace(['/', '\\', ' '], "_")
     ));
@@ -516,7 +613,16 @@ fn run_install(update: &AvailableUpdate, emit: &dyn Fn(UpdateEvent) -> bool) {
         return;
     }
 
-    // 4. Atomically self-replace the running executable and relaunch.
+    // 4. Cache release notes before replacing, then atomically self-replace and relaunch.
+    if let Some(notes) = update
+        .release_notes
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let _ = save_cached_changelog(&update.version, notes);
+    }
+
     if let Err(err) = self_replace::self_replace(&temp_path) {
         let _ = fs::remove_file(&temp_path);
         let _ = emit(UpdateEvent::Error {
@@ -529,7 +635,10 @@ fn run_install(update: &AvailableUpdate, emit: &dyn Fn(UpdateEvent) -> bool) {
 
     match std::env::current_exe() {
         Ok(exe_path) => {
-            if let Err(err) = std::process::Command::new(&exe_path).spawn() {
+            if let Err(err) = std::process::Command::new(&exe_path)
+                .arg("--just-updated")
+                .spawn()
+            {
                 let _ = emit(UpdateEvent::Error {
                     message: format!("Update installed, but automatic restart failed: {err}"),
                     silent: false,
@@ -544,6 +653,52 @@ fn run_install(update: &AvailableUpdate, emit: &dyn Fn(UpdateEvent) -> bool) {
                 silent: false,
             });
         }
+    }
+}
+
+#[cfg(feature = "online-updater")]
+fn run_fetch_changelog(repo: &str, version: &str, emit: &dyn Fn(UpdateEvent) -> bool) {
+    let repo_trimmed = repo.trim().trim_end_matches('/');
+    let ver = strip_v_prefix(version);
+    if repo_trimmed.is_empty() || ver.is_empty() {
+        return;
+    }
+
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .user_agent(user_agent())
+        .build()
+    else {
+        return;
+    };
+
+    let url = format!("https://api.github.com/repos/{repo_trimmed}/releases/tags/v{ver}");
+    let Ok(resp) = client.get(&url).send() else {
+        return;
+    };
+    if !resp.status().is_success() {
+        return;
+    }
+
+    #[derive(Deserialize)]
+    struct ReleaseNotesPayload {
+        body: Option<String>,
+    }
+
+    let Ok(payload) = resp.json::<ReleaseNotesPayload>() else {
+        return;
+    };
+
+    if let Some(notes) = payload
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let _ = emit(UpdateEvent::ChangelogLoaded {
+            version: ver.to_string(),
+            notes: notes.to_string(),
+        });
     }
 }
 
@@ -563,21 +718,71 @@ fn run_install(_update: &AvailableUpdate, emit: &dyn Fn(UpdateEvent) -> bool) {
     });
 }
 
+#[cfg(not(feature = "online-updater"))]
+fn run_fetch_changelog(_repo: &str, _version: &str, _emit: &dyn Fn(UpdateEvent) -> bool) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn selects_correct_windows_asset_per_architecture() {
+        assert_eq!(ASSET_X64, "QR-Hub-windows-x64.exe");
+        assert_eq!(ASSET_ARM64, "QR-Hub-windows-arm64.exe");
         assert_eq!(
             expected_asset_for_arch("x86_64").unwrap(),
-            "PostalAnnexQRScanner-windows-x64.exe"
+            "QR-Hub-windows-x64.exe"
         );
         assert_eq!(
             expected_asset_for_arch("aarch64").unwrap(),
-            "PostalAnnexQRScanner-windows-arm64.exe"
+            "QR-Hub-windows-arm64.exe"
         );
         assert!(expected_asset_for_arch("riscv64").is_err());
+    }
+
+    #[test]
+    fn issues_url_formats_and_falls_back_to_default_repo() {
+        assert_eq!(
+            issues_url("Owner/Repo"),
+            "https://github.com/Owner/Repo/issues"
+        );
+        assert_eq!(
+            issues_url("  Owner/Repo///  "),
+            "https://github.com/Owner/Repo/issues"
+        );
+        assert_eq!(
+            issues_url("   "),
+            format!("https://github.com/{DEFAULT_GITHUB_REPO}/issues")
+        );
+    }
+
+    #[test]
+    fn current_changelog_is_populated() {
+        assert!(CURRENT_CHANGELOG.contains("What's New?"));
+        assert!(CURRENT_CHANGELOG.contains("QR Hub"));
+    }
+
+    #[test]
+    fn cached_changelog_roundtrip_matches_version() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("qr_hub_changelog_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("last-update-notes.json");
+
+        save_cached_changelog_to(&path, "v2.0.2", "  - Fixed bug\n- Added feature  ")
+            .expect("save should succeed");
+
+        assert_eq!(
+            load_cached_changelog_from(&path, "2.0.2").as_deref(),
+            Some("- Fixed bug\n- Added feature")
+        );
+        assert_eq!(
+            load_cached_changelog_from(&path, "v2.0.2").as_deref(),
+            Some("- Fixed bug\n- Added feature")
+        );
+        assert_eq!(load_cached_changelog_from(&path, "2.0.3"), None);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

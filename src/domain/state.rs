@@ -127,8 +127,7 @@ impl ScannerStateMachine {
         }
 
         // Flush all prior scan state immediately.
-        self.screen = ScreenState::Ready;
-        self.last_print_job = None;
+        self.reset();
 
         match classify_scan(raw_text) {
             ScanRoute::HappyReturn { payload, rma } => {
@@ -136,40 +135,7 @@ impl ScannerStateMachine {
                 Vec::new()
             }
             ScanRoute::NoBoxNoLabel { payload, rma } => {
-                let scan_nonce = self.next_scan_nonce();
-                let header = Some("No Box No Label".to_string());
-                let mut effects = Vec::new();
-
-                let badge = if let Some(rma_val) = rma {
-                    effects.push(AppEffect::CopyToClipboard(rma_val.clone()));
-                    Some(AlertBadge::Green {
-                        text: format!("Amazon QR Detected! RMA Copied: {rma_val}"),
-                    })
-                } else {
-                    None
-                };
-
-                let job = PrintJob {
-                    payload: payload.clone(),
-                    header: header.clone(),
-                };
-                self.last_print_job = Some(job.clone());
-                self.screen = ScreenState::LabelReady {
-                    payload: payload.clone(),
-                    header,
-                    badge,
-                    scan_nonce,
-                };
-
-                effects.push(AppEffect::GenerateQr {
-                    payload,
-                    scan_nonce,
-                });
-                effects.push(AppEffect::Print {
-                    job,
-                    trigger: PrintTrigger::Auto,
-                });
-                effects
+                self.finalize_amazon_rma_label(payload, rma, "No Box No Label")
             }
             ScanRoute::CustomerPacked { payload, rma } => {
                 self.screen =
@@ -203,35 +169,17 @@ impl ScannerStateMachine {
                     return Vec::new();
                 }
 
-                let scan_nonce = self.next_scan_nonce();
-                let header = Some("Happy Return".to_string());
+                let clipboard_text = Some(payload.clone());
                 let badge = Some(AlertBadge::Yellow {
                     text: "Full QR code copied.\n⚠ Please mark the auto-detect tracking number as UPS in PostalMate, NOT Happy Returns.".to_string(),
                 });
-                let job = PrintJob {
-                    payload: payload.clone(),
-                    header: header.clone(),
-                };
-
-                self.last_print_job = Some(job.clone());
-                self.screen = ScreenState::LabelReady {
-                    payload: payload.clone(),
-                    header,
+                self.finalize_label(
+                    payload,
+                    Some("Happy Return".to_string()),
                     badge,
-                    scan_nonce,
-                };
-
-                vec![
-                    AppEffect::CopyToClipboard(payload.clone()),
-                    AppEffect::GenerateQr {
-                        payload,
-                        scan_nonce,
-                    },
-                    AppEffect::Print {
-                        job,
-                        trigger: PrintTrigger::Auto,
-                    },
-                ]
+                    clipboard_text,
+                    PrintTrigger::Auto,
+                )
             }
             PromptKind::CustomerPacked { payload, rma } => {
                 if !yes {
@@ -240,41 +188,7 @@ impl ScannerStateMachine {
                     return Vec::new();
                 }
 
-                let scan_nonce = self.next_scan_nonce();
-                let header = Some("Customer Packed".to_string());
-                let mut effects = Vec::new();
-
-                let badge = if let Some(rma_val) = rma {
-                    effects.push(AppEffect::CopyToClipboard(rma_val.clone()));
-                    Some(AlertBadge::Green {
-                        text: format!("Amazon QR Detected! RMA Copied: {rma_val}"),
-                    })
-                } else {
-                    None
-                };
-
-                let job = PrintJob {
-                    payload: payload.clone(),
-                    header: header.clone(),
-                };
-
-                self.last_print_job = Some(job.clone());
-                self.screen = ScreenState::LabelReady {
-                    payload: payload.clone(),
-                    header,
-                    badge,
-                    scan_nonce,
-                };
-
-                effects.push(AppEffect::GenerateQr {
-                    payload,
-                    scan_nonce,
-                });
-                effects.push(AppEffect::Print {
-                    job,
-                    trigger: PrintTrigger::Auto,
-                });
-                effects
+                self.finalize_amazon_rma_label(payload, rma, "Customer Packed")
             }
         }
     }
@@ -291,30 +205,7 @@ impl ScannerStateMachine {
             }
         };
 
-        let scan_nonce = self.next_scan_nonce();
-        let job = PrintJob {
-            payload: payload.clone(),
-            header: None,
-        };
-
-        self.last_print_job = Some(job.clone());
-        self.screen = ScreenState::LabelReady {
-            payload: payload.clone(),
-            header: None,
-            badge: None,
-            scan_nonce,
-        };
-
-        vec![
-            AppEffect::GenerateQr {
-                payload,
-                scan_nonce,
-            },
-            AppEffect::Print {
-                job,
-                trigger: PrintTrigger::Manual,
-            },
-        ]
+        self.finalize_label(payload, None, None, None, PrintTrigger::Manual)
     }
 
     /// Re-dispatches the last generated [`PrintJob`] without modifying the clipboard.
@@ -342,6 +233,58 @@ impl ScannerStateMachine {
     pub fn reset(&mut self) {
         self.screen = ScreenState::Ready;
         self.last_print_job = None;
+    }
+
+    fn finalize_amazon_rma_label(
+        &mut self,
+        payload: String,
+        rma: Option<String>,
+        header: &str,
+    ) -> Vec<AppEffect> {
+        let badge = rma.as_ref().map(|rma_val| AlertBadge::Green {
+            text: format!("Amazon QR Detected! RMA Copied: {rma_val}"),
+        });
+        self.finalize_label(
+            payload,
+            Some(header.to_string()),
+            badge,
+            rma,
+            PrintTrigger::Auto,
+        )
+    }
+
+    fn finalize_label(
+        &mut self,
+        payload: String,
+        header: Option<String>,
+        badge: Option<AlertBadge>,
+        clipboard_text: Option<String>,
+        trigger: PrintTrigger,
+    ) -> Vec<AppEffect> {
+        let scan_nonce = self.next_scan_nonce();
+        let job = PrintJob {
+            payload: payload.clone(),
+            header: header.clone(),
+        };
+
+        self.last_print_job = Some(job.clone());
+        self.screen = ScreenState::LabelReady {
+            payload: payload.clone(),
+            header,
+            badge,
+            scan_nonce,
+        };
+
+        let mut effects = Vec::with_capacity(if clipboard_text.is_some() { 3 } else { 2 });
+        if let Some(text) = clipboard_text {
+            effects.push(AppEffect::CopyToClipboard(text));
+        }
+        effects.push(AppEffect::GenerateQr {
+            payload,
+            scan_nonce,
+        });
+        effects.push(AppEffect::Print { job, trigger });
+        effects
     }
 
     fn next_scan_nonce(&mut self) -> u64 {

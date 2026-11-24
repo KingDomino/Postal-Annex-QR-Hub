@@ -1,3 +1,8 @@
+const PRODUCT_NAME: &str = "QR Hub";
+const FILE_DESCRIPTION: &str = "QR Hub - PostalAnnex+ Amazon QR Code Scanner";
+const ORIGINAL_FILENAME: &str = "QR Hub.exe";
+const COMPANY_NAME: &str = "PostalAnnex+";
+
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=build.rs");
@@ -7,13 +12,10 @@ fn main() {
         if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
             let mut res = winresource::WindowsResource::new();
             res.set_icon("assets/icon.ico");
-            res.set("ProductName", "PostalAnnex+ Amazon QR Code Scanner");
-            res.set(
-                "FileDescription",
-                "PostalAnnex+ Amazon QR Code Scanner & 4x6 Thermal Label Printer",
-            );
-            res.set("OriginalFilename", "PostalAnnexQRScanner.exe");
-            res.set("CompanyName", "PostalAnnex+");
+            res.set("ProductName", PRODUCT_NAME);
+            res.set("FileDescription", FILE_DESCRIPTION);
+            res.set("OriginalFilename", ORIGINAL_FILENAME);
+            res.set("CompanyName", COMPANY_NAME);
             if let Err(err) = res.compile() {
                 panic!("Failed to compile Windows resource: {err}");
             }
@@ -77,11 +79,11 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
-      VALUE "CompanyName", "PostalAnnex+\0"
-      VALUE "FileDescription", "PostalAnnex+ Amazon QR Code Scanner & 4x6 Thermal Label Printer\0"
+      VALUE "CompanyName", "{COMPANY_NAME}\0"
+      VALUE "FileDescription", "{FILE_DESCRIPTION}\0"
       VALUE "FileVersion", "{version}\0"
-      VALUE "OriginalFilename", "PostalAnnexQRScanner.exe\0"
-      VALUE "ProductName", "PostalAnnex+ Amazon QR Code Scanner\0"
+      VALUE "OriginalFilename", "{ORIGINAL_FILENAME}\0"
+      VALUE "ProductName", "{PRODUCT_NAME}\0"
       VALUE "ProductVersion", "{version}\0"
     END
   END

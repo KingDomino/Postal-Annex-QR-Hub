@@ -8,11 +8,14 @@ use eframe::egui;
 use postal_annex_qr_scanner::icon::window_icon_rgba;
 use postal_annex_qr_scanner::installer::{self, StartupAction};
 
-const WINDOW_TITLE: &str = "PostalAnnex+ Amazon QR Code Scanner";
+const WINDOW_TITLE: &str = "QR Hub";
 
 fn main() -> eframe::Result<()> {
-    let just_installed = match installer::handle_startup() {
-        StartupAction::RunApp { just_installed } => just_installed,
+    let (just_installed, just_updated) = match installer::handle_startup() {
+        StartupAction::RunApp {
+            just_installed,
+            just_updated,
+        } => (just_installed, just_updated),
         StartupAction::Exit => return Ok(()),
     };
 
@@ -26,8 +29,9 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         centered: true,
         viewport: egui::ViewportBuilder::default()
+            .with_decorations(false)
             .with_title(WINDOW_TITLE)
-            .with_inner_size([460.0, 720.0])
+            .with_inner_size([460.0, 740.0])
             .with_min_inner_size([400.0, 560.0])
             .with_resizable(true)
             .with_icon(Arc::new(icon_data)),
@@ -37,6 +41,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         WINDOW_TITLE,
         native_options,
-        Box::new(move |cc| Ok(Box::new(ui::ScannerApp::new(cc, just_installed)))),
+        Box::new(move |cc| Ok(Box::new(ui::ScannerApp::new(cc, just_installed, just_updated)))),
     )
 }

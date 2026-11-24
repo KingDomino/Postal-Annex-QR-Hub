@@ -14,11 +14,16 @@ pub fn window_icon_rgba() -> (Vec<u8>, u32, u32) {
 
 /// Renders the PostalAnnex+ QR icon at any square resolution `size x size`.
 pub fn render_icon_rgba(size: u32) -> Vec<u8> {
+    if size == 0 {
+        return Vec::new();
+    }
+
     const NAVY: [f32; 3] = [0.0, 47.0, 108.0]; // #002f6c
     const RED: [f32; 3] = [209.0, 18.0, 38.0]; // #d11226
     const WHITE: [f32; 3] = [255.0, 255.0, 255.0];
 
-    let mut out = vec![0u8; (size * size * 4) as usize];
+    let size_usize = size as usize;
+    let mut out = vec![0u8; size_usize * size_usize * 4];
     let size_f = size as f32;
     let aa = (1.25 / size_f).max(0.005);
 
@@ -83,7 +88,7 @@ pub fn render_icon_rgba(size: u32) -> Vec<u8> {
                 rgb = blend_rgb(rgb, WHITE, plus_cov);
             }
 
-            let idx = ((y * size + x) * 4) as usize;
+            let idx = (y as usize * size_usize + x as usize) * 4;
             out[idx] = rgb[0].round().clamp(0.0, 255.0) as u8;
             out[idx + 1] = rgb[1].round().clamp(0.0, 255.0) as u8;
             out[idx + 2] = rgb[2].round().clamp(0.0, 255.0) as u8;

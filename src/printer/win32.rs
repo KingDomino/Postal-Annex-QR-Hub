@@ -289,7 +289,7 @@ pub fn print_label_gdi(job: &PrintJob, config: &AppConfig) -> Result<(), String>
         .map(to_wide_null)
         .unwrap_or_default();
 
-    let header_height_px = if let Some(ref text) = header_upper {
+    let header_height_px = if header_upper.is_some() {
         let mut sz = SIZE::default();
         let char_count = header_wide.len().saturating_sub(1);
         let ok = unsafe {
@@ -298,7 +298,6 @@ pub fn print_label_gdi(job: &PrintJob, config: &AppConfig) -> Result<(), String>
         if ok && sz.cy > 0 {
             sz.cy
         } else {
-            let _ = text;
             font_height.abs()
         }
     } else {

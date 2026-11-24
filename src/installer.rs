@@ -1,32 +1,47 @@
 //! Zero-UAC per-user Windows self-installer, Start Menu / Desktop shortcuts, and uninstaller.
 //!
-//! When a release binary is launched from outside `%LOCALAPPDATA%\PostalAnnexQRScanner\`
-//! (for example from Downloads or Desktop), [`handle_startup`] installs it into the
-//! canonical per-user directory, creates the Start Menu shortcut, registers Add/Remove
-//! Programs (`HKCU\...\Uninstall\PostalAnnexQRScanner`), launches the installed copy
-//! with `--just-installed`, and asks the caller to exit. Subsequent auto-updates run
-//! `self_replace` in place so all shortcuts remain valid with zero UAC prompts.
+//! When a release binary is launched from outside `%LOCALAPPDATA%\QR Hub\`
+//! (for example from Downloads, Desktop, or the legacy `%LOCALAPPDATA%\PostalAnnexQRScanner\`
+//! directory during an upgrade), [`handle_startup`] installs it into the canonical per-user
+//! directory, creates the Start Menu shortcut, registers Add/Remove Programs
+//! (`HKCU\...\Uninstall\QRHub`), cleans up any legacy shortcuts/registry keys, launches the
+//! installed copy with `--just-installed` (or `--just-updated` when migrating/updating),
+//! and asks the caller to exit. Subsequent auto-updates run `self_replace` in place so all
+//! shortcuts remain valid with zero UAC prompts.
 
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
 
 /// Full display name shown in Windows Installed Apps and shortcut tooltips.
-pub const APP_DISPLAY_NAME: &str = "PostalAnnex+ Amazon QR Code Scanner";
+pub const APP_DISPLAY_NAME: &str = "QR Hub";
 /// Shortcut filename placed in Start Menu Programs and optionally on Desktop.
-pub const SHORTCUT_FILENAME: &str = "PostalAnnex+ Amazon QR Scanner.lnk";
+pub const SHORTCUT_FILENAME: &str = "QR Hub.lnk";
 /// Directory name under `%LOCALAPPDATA%` holding the installed executable.
-pub const INSTALL_DIR_NAME: &str = "PostalAnnexQRScanner";
+pub const INSTALL_DIR_NAME: &str = "QR Hub";
 /// Canonical installed executable filename.
-pub const INSTALLED_EXE_NAME: &str = "PostalAnnexQRScanner.exe";
+pub const INSTALLED_EXE_NAME: &str = "QR Hub.exe";
 /// Per-user Uninstall registry subkey under `HKEY_CURRENT_USER`.
 pub const UNINSTALL_REG_SUBKEY: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\QRHub";
+
+/// Legacy v2.0.1 shortcut filename cleaned up on upgrade and uninstall.
+pub const LEGACY_SHORTCUT_FILENAME: &str = "PostalAnnex+ Amazon QR Scanner.lnk";
+/// Legacy v2.0.1 Uninstall registry subkey cleaned up on upgrade and uninstall.
+pub const LEGACY_UNINSTALL_REG_SUBKEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PostalAnnexQRScanner";
+/// Legacy v2.0.1 directory name under `%LOCALAPPDATA%`.
+pub const LEGACY_INSTALL_DIR_NAME: &str = "PostalAnnexQRScanner";
+/// Legacy v2.0.1 executable filename.
+pub const LEGACY_EXE_NAME: &str = "PostalAnnexQRScanner.exe";
 
 /// Action returned by [`handle_startup`] telling `main()` whether to run or exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupAction {
-    RunApp { just_installed: bool },
+    RunApp {
+        just_installed: bool,
+        just_updated: bool,
+    },
     Exit,
 }
 
@@ -38,6 +53,7 @@ pub struct CliFlags {
     pub quiet: bool,
     pub portable: bool,
     pub just_installed: bool,
+    pub just_updated: bool,
 }
 
 /// Parses installer CLI flags from an argument iterator (skipping argv[0] or scanning all).
@@ -54,6 +70,7 @@ where
             "--quiet" | "/quiet" | "/s" => flags.quiet = true,
             "--portable" | "/portable" => flags.portable = true,
             "--just-installed" => flags.just_installed = true,
+            "--just-updated" => flags.just_updated = true,
             _ => {}
         }
     }
@@ -78,14 +95,24 @@ fn normalize_path_for_cmp(path: &Path) -> String {
     stripped.trim_end_matches('\\').to_ascii_lowercase()
 }
 
-/// Returns the canonical per-user installation directory (`%LOCALAPPDATA%\PostalAnnexQRScanner`).
+/// Returns the canonical per-user installation directory (`%LOCALAPPDATA%\QR Hub`).
 pub fn install_dir() -> Option<PathBuf> {
     BaseDirs::new().map(|b| b.data_local_dir().join(INSTALL_DIR_NAME))
 }
 
-/// Returns the canonical installed executable path (`%LOCALAPPDATA%\PostalAnnexQRScanner\PostalAnnexQRScanner.exe`).
+/// Returns the canonical installed executable path (`%LOCALAPPDATA%\QR Hub\QR Hub.exe`).
 pub fn install_exe_path() -> Option<PathBuf> {
     install_dir().map(|dir| dir.join(INSTALLED_EXE_NAME))
+}
+
+/// Returns the legacy v2.0.1 installed executable path
+/// (`%LOCALAPPDATA%\PostalAnnexQRScanner\PostalAnnexQRScanner.exe`).
+pub fn legacy_install_exe_path() -> Option<PathBuf> {
+    BaseDirs::new().map(|b| {
+        b.data_local_dir()
+            .join(LEGACY_INSTALL_DIR_NAME)
+            .join(LEGACY_EXE_NAME)
+    })
 }
 
 /// Returns `true` when the current process executable is already running from [`install_exe_path`].
@@ -110,6 +137,7 @@ pub fn handle_startup() -> StartupAction {
         } else {
             StartupAction::RunApp {
                 just_installed: flags.just_installed,
+                just_updated: flags.just_updated,
             }
         }
     }
@@ -166,8 +194,9 @@ mod win32_impl {
     };
 
     use super::{
-        install_dir, install_exe_path, paths_equivalent, CliFlags, StartupAction,
-        APP_DISPLAY_NAME, INSTALLED_EXE_NAME, SHORTCUT_FILENAME, UNINSTALL_REG_SUBKEY,
+        install_dir, install_exe_path, legacy_install_exe_path, paths_equivalent, CliFlags,
+        StartupAction, APP_DISPLAY_NAME, INSTALLED_EXE_NAME, LEGACY_SHORTCUT_FILENAME,
+        LEGACY_UNINSTALL_REG_SUBKEY, SHORTCUT_FILENAME, UNINSTALL_REG_SUBKEY,
     };
     use crate::config::DEFAULT_GITHUB_REPO;
     use crate::updater::CURRENT_VERSION;
@@ -447,42 +476,50 @@ mod win32_impl {
         }
     }
 
-    fn start_menu_shortcut_path() -> Result<PathBuf, String> {
-        Ok(known_folder_path(&FOLDERID_Programs)?.join(SHORTCUT_FILENAME))
+    fn start_menu_shortcut_path(filename: &str) -> Result<PathBuf, String> {
+        Ok(known_folder_path(&FOLDERID_Programs)?.join(filename))
     }
 
-    fn desktop_shortcut_path() -> Result<PathBuf, String> {
-        Ok(known_folder_path(&FOLDERID_Desktop)?.join(SHORTCUT_FILENAME))
+    fn desktop_shortcut_path(filename: &str) -> Result<PathBuf, String> {
+        Ok(known_folder_path(&FOLDERID_Desktop)?.join(filename))
     }
 
-    pub(super) fn ensure_start_menu_shortcut_win() -> Result<PathBuf, String> {
+    fn resolve_shortcut_target() -> Result<(PathBuf, PathBuf), String> {
         let dest_dir = install_dir().ok_or_else(|| "Could not locate %LOCALAPPDATA%.".to_string())?;
         let dest_exe = dest_dir.join(INSTALLED_EXE_NAME);
-        let (target_exe, work_dir) = if dest_exe.exists() {
-            (dest_exe, dest_dir)
+        if dest_exe.exists() {
+            Ok((dest_exe, dest_dir))
         } else {
             let cur = std::env::current_exe()
                 .map_err(|e| format!("Could not resolve executable path: {e}"))?;
             let work = cur.parent().map(Path::to_path_buf).unwrap_or(dest_dir);
-            (cur, work)
-        };
-        let lnk = start_menu_shortcut_path()?;
+            Ok((cur, work))
+        }
+    }
+
+    fn cleanup_legacy_install_artifacts() {
+        if let Ok(lnk) = start_menu_shortcut_path(LEGACY_SHORTCUT_FILENAME) {
+            let _ = fs::remove_file(lnk);
+        }
+        if let Ok(lnk) = desktop_shortcut_path(LEGACY_SHORTCUT_FILENAME) {
+            let _ = fs::remove_file(lnk);
+        }
+        let legacy_subkey_w = to_wide_null(LEGACY_UNINSTALL_REG_SUBKEY);
+        unsafe {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(legacy_subkey_w.as_ptr()));
+        }
+    }
+
+    pub(super) fn ensure_start_menu_shortcut_win() -> Result<PathBuf, String> {
+        let (target_exe, work_dir) = resolve_shortcut_target()?;
+        let lnk = start_menu_shortcut_path(SHORTCUT_FILENAME)?;
         create_shortcut(&lnk, &target_exe, &work_dir, APP_DISPLAY_NAME)?;
         Ok(lnk)
     }
 
     pub(super) fn create_desktop_shortcut_win() -> Result<PathBuf, String> {
-        let dest_dir = install_dir().ok_or_else(|| "Could not locate %LOCALAPPDATA%.".to_string())?;
-        let dest_exe = dest_dir.join(INSTALLED_EXE_NAME);
-        let (target_exe, work_dir) = if dest_exe.exists() {
-            (dest_exe, dest_dir)
-        } else {
-            let cur = std::env::current_exe()
-                .map_err(|e| format!("Could not resolve executable path: {e}"))?;
-            let work = cur.parent().map(Path::to_path_buf).unwrap_or(dest_dir);
-            (cur, work)
-        };
-        let lnk = desktop_shortcut_path()?;
+        let (target_exe, work_dir) = resolve_shortcut_target()?;
+        let lnk = desktop_shortcut_path(SHORTCUT_FILENAME)?;
         create_shortcut(&lnk, &target_exe, &work_dir, APP_DISPLAY_NAME)?;
         Ok(lnk)
     }
@@ -490,7 +527,7 @@ mod win32_impl {
     fn run_uninstall(quiet: bool) {
         if !quiet {
             let prompt = to_wide_null(
-                "Uninstall PostalAnnex+ Amazon QR Code Scanner?\n\nYour saved printer settings will be kept.",
+                "Uninstall QR Hub?\n\nYour saved printer settings will be kept.",
             );
             let title = to_wide_null(APP_DISPLAY_NAME);
             let choice = unsafe {
@@ -506,10 +543,10 @@ mod win32_impl {
             }
         }
 
-        if let Ok(lnk) = start_menu_shortcut_path() {
+        if let Ok(lnk) = start_menu_shortcut_path(SHORTCUT_FILENAME) {
             let _ = fs::remove_file(lnk);
         }
-        if let Ok(lnk) = desktop_shortcut_path() {
+        if let Ok(lnk) = desktop_shortcut_path(SHORTCUT_FILENAME) {
             let _ = fs::remove_file(lnk);
         }
 
@@ -517,6 +554,8 @@ mod win32_impl {
         unsafe {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr()));
         }
+
+        cleanup_legacy_install_artifacts();
 
         if let Some(dir) = install_dir() {
             cleanup_old_binaries(&dir);
@@ -536,9 +575,7 @@ mod win32_impl {
         }
 
         if !quiet {
-            let msg = to_wide_null(
-                "PostalAnnex+ Amazon QR Code Scanner has been uninstalled.",
-            );
+            let msg = to_wide_null("QR Hub has been uninstalled.");
             let title = to_wide_null(APP_DISPLAY_NAME);
             unsafe {
                 MessageBoxW(
@@ -560,6 +597,7 @@ mod win32_impl {
         if flags.portable {
             return StartupAction::RunApp {
                 just_installed: false,
+                just_updated: flags.just_updated,
             };
         }
 
@@ -568,12 +606,14 @@ mod win32_impl {
         else {
             return StartupAction::RunApp {
                 just_installed: false,
+                just_updated: flags.just_updated,
             };
         };
 
         if paths_equivalent(&cur_exe, &dest_exe) {
             cleanup_old_binaries(&dest_dir);
-            if let Ok(lnk) = start_menu_shortcut_path() {
+            cleanup_legacy_install_artifacts();
+            if let Ok(lnk) = start_menu_shortcut_path(SHORTCUT_FILENAME) {
                 if !lnk.exists() {
                     let _ = create_shortcut(&lnk, &dest_exe, &dest_dir, APP_DISPLAY_NAME);
                 }
@@ -581,26 +621,39 @@ mod win32_impl {
             let _ = register_uninstall_entry(&dest_dir, &dest_exe);
             return StartupAction::RunApp {
                 just_installed: flags.just_installed,
+                just_updated: flags.just_updated,
             };
         }
 
+        let from_legacy_install = legacy_install_exe_path()
+            .is_some_and(|legacy_exe| paths_equivalent(&cur_exe, &legacy_exe));
+        let is_update_migration = from_legacy_install || flags.just_updated;
+
         if !cfg!(debug_assertions) || flags.install {
             if install_binary(&cur_exe, &dest_dir, &dest_exe).is_ok() {
-                if let Ok(lnk) = start_menu_shortcut_path() {
+                cleanup_legacy_install_artifacts();
+                if let Ok(lnk) = start_menu_shortcut_path(SHORTCUT_FILENAME) {
                     let _ = create_shortcut(&lnk, &dest_exe, &dest_dir, APP_DISPLAY_NAME);
                 }
                 let _ = register_uninstall_entry(&dest_dir, &dest_exe);
-                if Command::new(&dest_exe).arg("--just-installed").spawn().is_ok() {
+                let launch_flag = if is_update_migration {
+                    "--just-updated"
+                } else {
+                    "--just-installed"
+                };
+                if Command::new(&dest_exe).arg(launch_flag).spawn().is_ok() {
                     return StartupAction::Exit;
                 }
                 return StartupAction::RunApp {
-                    just_installed: true,
+                    just_installed: !is_update_migration,
+                    just_updated: is_update_migration,
                 };
             }
         }
 
         StartupAction::RunApp {
-            just_installed: false,
+            just_installed: flags.just_installed,
+            just_updated: flags.just_updated,
         }
     }
 }
@@ -618,6 +671,7 @@ mod tests {
             "/QUIET",
             "--portable",
             "--just-installed",
+            "--JUST-UPDATED",
             "ignored-arg",
         ]);
         assert!(parsed.install);
@@ -625,25 +679,27 @@ mod tests {
         assert!(parsed.quiet);
         assert!(parsed.portable);
         assert!(parsed.just_installed);
+        assert!(parsed.just_updated);
 
         let uninstall = parse_cli_flags(["/uninstall", "--quiet"]);
         assert!(uninstall.uninstall);
         assert!(uninstall.quiet);
+        assert!(!uninstall.just_updated);
     }
 
     #[test]
     fn paths_equivalent_handles_windows_prefixes_slashes_and_casing() {
         assert!(paths_equivalent(
-            Path::new(r"\\?\C:\Users\Domino\AppData\Local\PostalAnnexQRScanner\PostalAnnexQRScanner.exe"),
-            Path::new(r"c:/users/domino/appdata/local/postalannexqrscanner/postalannexqrscanner.exe")
+            Path::new(r"\\?\C:\Users\Domino\AppData\Local\QR Hub\QR Hub.exe"),
+            Path::new(r"c:/users/domino/appdata/local/qr hub/qr hub.exe")
         ));
         assert!(paths_equivalent(
-            Path::new(r"C:\Apps\Scanner\"),
-            Path::new(r"c:\apps\scanner")
+            Path::new(r"C:\Apps\QR Hub\"),
+            Path::new(r"c:\apps\qr hub")
         ));
         assert!(!paths_equivalent(
-            Path::new(r"C:\Users\Domino\Downloads\PostalAnnexQRScanner.exe"),
-            Path::new(r"C:\Users\Domino\AppData\Local\PostalAnnexQRScanner\PostalAnnexQRScanner.exe")
+            Path::new(r"C:\Users\Domino\Downloads\QR-Hub-windows-x64.exe"),
+            Path::new(r"C:\Users\Domino\AppData\Local\QR Hub\QR Hub.exe")
         ));
     }
 
@@ -651,7 +707,29 @@ mod tests {
     fn install_exe_path_uses_canonical_directory_and_filename() {
         let exe = install_exe_path().expect("install path should resolve");
         let dir = exe.parent().expect("install dir parent");
-        assert_eq!(exe.file_name().unwrap(), INSTALLED_EXE_NAME);
-        assert_eq!(dir.file_name().unwrap(), INSTALL_DIR_NAME);
+        assert_eq!(exe.file_name().unwrap(), "QR Hub.exe");
+        assert_eq!(dir.file_name().unwrap(), "QR Hub");
+        assert_eq!(APP_DISPLAY_NAME, "QR Hub");
+        assert_eq!(SHORTCUT_FILENAME, "QR Hub.lnk");
+
+        let legacy = legacy_install_exe_path().expect("legacy install path should resolve");
+        assert_eq!(legacy.file_name().unwrap(), LEGACY_EXE_NAME);
+        assert_eq!(legacy.parent().unwrap().file_name().unwrap(), LEGACY_INSTALL_DIR_NAME);
+    }
+
+    #[test]
+    fn startup_action_carries_install_and_update_flags() {
+        let action = StartupAction::RunApp {
+            just_installed: false,
+            just_updated: true,
+        };
+        assert_eq!(
+            action,
+            StartupAction::RunApp {
+                just_installed: false,
+                just_updated: true,
+            }
+        );
+        assert_ne!(action, StartupAction::Exit);
     }
 }

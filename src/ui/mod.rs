@@ -1,14 +1,18 @@
-//! Native `eframe` / `egui` user interface for the PostalAnnex+ Amazon QR Code Scanner.
+//! Native `eframe` / `egui` user interface for QR Hub (PostalAnnex+ Amazon QR Code Scanner).
 //!
 //! - [`app`]: homepage (invisible scan capture, prompts, QR materialization, footer).
+//! - [`chrome`]: seamless borderless window titlebar, controls, and 8-way resize frame.
 //! - [`settings`]: modal settings overlay (printer, 4" x 6" calibration, updates).
+//! - [`whats_new`]: post-update "What's New?" changelog modal with live GitHub mirroring.
 //!
 //! This module also hosts the shared brand palette, font setup and small custom-painted
 //! widgets. Every clickable homepage control is created with `Sense::CLICK` only (never
 //! `FOCUSABLE`), so the USB HID scanner's trailing `Enter` can never "press" a button.
 
 mod app;
+mod chrome;
 mod settings;
+mod whats_new;
 
 pub use app::ScannerApp;
 
@@ -19,7 +23,7 @@ use std::time::Duration;
 
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Frame,
-    InnerResponse, Margin, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind,
+    InnerResponse, Margin, Painter, Pos2, Rect, Response, Sense, Shadow, Shape, Stroke, StrokeKind,
     TextFormat, Ui, Vec2,
 };
 
@@ -75,6 +79,8 @@ pub(crate) mod colors {
 
 /// Maximum width of the white homepage card (inside the default 460 px window).
 pub(crate) const CARD_MAX_WIDTH: f32 = 404.0;
+/// Width of centered modal dialogs (Settings and "What's New?").
+pub(crate) const MODAL_WIDTH: f32 = 390.0;
 /// Minimum horizontal breathing room on each side of the card.
 pub(crate) const CARD_MIN_SIDE_MARGIN: f32 = 14.0;
 /// Edge length of the on-screen QR preview frame.
@@ -383,6 +389,27 @@ impl ButtonStyle {
         self.radius = radius;
         self
     }
+}
+
+/// Shared neutral gray button style used for secondary controls across the app.
+pub(crate) const fn secondary_button_style() -> ButtonStyle {
+    ButtonStyle::solid(colors::GRAY_200, colors::GRAY_300, colors::TEXT_BODY)
+        .with_stroke(colors::GRAY_400)
+}
+
+/// Shared white rounded modal card frame with soft elevation shadow.
+pub(crate) fn modal_frame() -> Frame {
+    Frame::new()
+        .fill(colors::WHITE)
+        .stroke(Stroke::new(1.0_f32, colors::CARD_STROKE))
+        .corner_radius(CornerRadius::same(12))
+        .shadow(Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(64),
+        })
+        .inner_margin(Margin::same(20))
 }
 
 fn darken(color: Color32, factor: f32) -> Color32 {

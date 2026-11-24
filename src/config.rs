@@ -1,4 +1,5 @@
-//! Persistent application configuration stored in `%APPDATA%\PostalAnnexQRScanner\config.json`.
+//! Persistent application configuration stored in `%APPDATA%\QR Hub\config.json`
+//! (with automatic read fallback to legacy `%APPDATA%\PostalAnnexQRScanner\config.json`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 /// Default GitHub repository used for architecture-aware auto-updates.
 pub const DEFAULT_GITHUB_REPO: &str = "KingDomino/Postal-Annex-QR-Hub";
+
+const CONFIG_DIR_NAME: &str = "QR Hub";
+const LEGACY_CONFIG_DIR_NAME: &str = "PostalAnnexQRScanner";
+const CONFIG_FILENAME: &str = "config.json";
 
 /// Persistent user configuration matching `SPEC.md` §6.3.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,6 +28,8 @@ pub struct AppConfig {
     pub offset_y_mm: f32,
     pub auto_check_updates: bool,
     pub github_repo: String,
+    #[serde(default)]
+    pub last_seen_version: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -38,29 +45,57 @@ impl Default for AppConfig {
             offset_y_mm: 0.0,
             auto_check_updates: true,
             github_repo: DEFAULT_GITHUB_REPO.to_string(),
+            last_seen_version: None,
         }
     }
 }
 
+/// Resolves the platform configuration directory:
+/// - Windows: `%APPDATA%\QR Hub`
+/// - macOS / Linux: standard user config directory + `QR Hub`
+pub fn config_dir() -> Option<PathBuf> {
+    BaseDirs::new().map(|b| b.config_dir().join(CONFIG_DIR_NAME))
+}
+
 /// Resolves the platform config file path:
-/// - Windows: `%APPDATA%\PostalAnnexQRScanner\config.json`
-/// - macOS / Linux: standard user config directory + `PostalAnnexQRScanner/config.json`
+/// - Windows: `%APPDATA%\QR Hub\config.json`
+/// - macOS / Linux: standard user config directory + `QR Hub/config.json`
 pub fn config_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join(CONFIG_FILENAME))
+}
+
+fn legacy_config_path() -> Option<PathBuf> {
     BaseDirs::new().map(|b| {
         b.config_dir()
-            .join("PostalAnnexQRScanner")
-            .join("config.json")
+            .join(LEGACY_CONFIG_DIR_NAME)
+            .join(CONFIG_FILENAME)
     })
 }
 
 impl AppConfig {
-    /// Loads the config from the default [`config_path`], returning [`Self::default`]
-    /// if the file does not exist or cannot be parsed.
+    /// Loads the config from the default [`config_path`], falling back to the legacy
+    /// `PostalAnnexQRScanner/config.json` location if present, or [`Self::default`]
+    /// if neither exists or can be parsed.
     pub fn load() -> Self {
-        match config_path() {
-            Some(path) => Self::load_from(&path).unwrap_or_default(),
-            None => Self::default(),
+        Self::load_with_existing_flag().0
+    }
+
+    /// Loads configuration from [`config_path`] (or legacy `PostalAnnexQRScanner/config.json`
+    /// if the new path does not exist yet), returning `(config, existed_on_disk)`.
+    pub fn load_with_existing_flag() -> (Self, bool) {
+        Self::load_with_fallback(config_path().as_deref(), legacy_config_path().as_deref())
+    }
+
+    /// Loads from `primary` if it exists on disk, otherwise from `legacy` if it exists.
+    /// Returns `(cfg, true)` if either file was present on disk, or `(Self::default(), false)`.
+    pub fn load_with_fallback(primary: Option<&Path>, legacy: Option<&Path>) -> (Self, bool) {
+        if let Some(path) = primary.filter(|p| p.exists()) {
+            return (Self::load_from(path).unwrap_or_default(), true);
         }
+        if let Some(path) = legacy.filter(|p| p.exists()) {
+            return (Self::load_from(path).unwrap_or_default(), true);
+        }
+        (Self::default(), false)
     }
 
     /// Loads configuration from a specific JSON file path.
@@ -122,15 +157,27 @@ mod tests {
         assert!((cfg.offset_y_mm - 0.0).abs() < 1e-6);
         assert!(cfg.auto_check_updates);
         assert_eq!(cfg.github_repo, DEFAULT_GITHUB_REPO);
+        assert_eq!(cfg.last_seen_version, None);
+    }
+
+    #[test]
+    fn last_seen_version_roundtrips_and_defaults_to_none() {
+        let with_ver = r#"{"last_seen_version": "2.0.2"}"#;
+        let parsed: AppConfig = serde_json::from_str(with_ver).expect("should parse version");
+        assert_eq!(parsed.last_seen_version.as_deref(), Some("2.0.2"));
+
+        let serialized = serde_json::to_string(&parsed).expect("should serialize");
+        let reparsed: AppConfig = serde_json::from_str(&serialized).expect("should reparse");
+        assert_eq!(reparsed.last_seen_version.as_deref(), Some("2.0.2"));
+
+        let omitted: AppConfig = serde_json::from_str("{}").expect("should parse empty object");
+        assert_eq!(omitted.last_seen_version, None);
     }
 
     #[test]
     fn save_and_load_roundtrip_on_disk() {
         let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "postal_annex_cfg_test_{}",
-            std::process::id()
-        ));
+        dir.push(format!("qr_hub_cfg_test_{}", std::process::id()));
         let path = dir.join("nested").join("config.json");
 
         let cfg = AppConfig {
@@ -144,6 +191,7 @@ mod tests {
             offset_y_mm: 2.5,
             auto_check_updates: false,
             github_repo: "Example/Repo".to_string(),
+            last_seen_version: Some("2.0.2".to_string()),
         };
 
         cfg.save_to(&path).expect("save_to should succeed");
@@ -151,6 +199,53 @@ mod tests {
         assert_eq!(loaded, cfg);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_with_fallback_migrates_legacy_and_prefers_primary() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("qr_hub_cfg_migration_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let primary = dir.join("QR Hub").join("config.json");
+        let legacy = dir.join("PostalAnnexQRScanner").join("config.json");
+
+        // Neither exists -> default, existed = false
+        let (cfg, existed) = AppConfig::load_with_fallback(Some(&primary), Some(&legacy));
+        assert!(!existed);
+        assert_eq!(cfg, AppConfig::default());
+
+        // Legacy exists -> loads legacy printer calibration, existed = true
+        let legacy_cfg = AppConfig {
+            printer_name: Some("ZDesigner GK420d".to_string()),
+            offset_x_mm: 2.25,
+            ..Default::default()
+        };
+        legacy_cfg.save_to(&legacy).expect("save legacy");
+        let (cfg, existed) = AppConfig::load_with_fallback(Some(&primary), Some(&legacy));
+        assert!(existed);
+        assert_eq!(cfg, legacy_cfg);
+
+        // Both exist -> primary takes precedence over legacy
+        let primary_cfg = AppConfig {
+            printer_name: Some("Zebra ZD421".to_string()),
+            last_seen_version: Some("2.0.2".to_string()),
+            ..Default::default()
+        };
+        primary_cfg.save_to(&primary).expect("save primary");
+        let (cfg, existed) = AppConfig::load_with_fallback(Some(&primary), Some(&legacy));
+        assert!(existed);
+        assert_eq!(cfg, primary_cfg);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_dir_and_path_use_qr_hub_folder() {
+        let dir = config_dir().expect("config_dir should resolve");
+        let path = config_path().expect("config_path should resolve");
+        assert_eq!(dir.file_name().unwrap(), "QR Hub");
+        assert_eq!(path, dir.join("config.json"));
     }
 
     #[test]

@@ -1,3 +1,5 @@
+//! Pure domain logic: scan capture buffer, payload parser, and application state machine.
+
 pub mod buffer;
 pub mod parser;
 pub mod state;

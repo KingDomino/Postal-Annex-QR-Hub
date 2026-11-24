@@ -2,7 +2,7 @@
 //!
 //! Exposes pure domain logic, QR encoding & animation math, persistent configuration,
 //! clipboard retry helper, Win32/cross-platform thermal printing, icon rendering,
-//! and the architecture-aware GitHub Releases auto-updater.
+//! self-install/shortcut management, and the architecture-aware GitHub Releases auto-updater.
 
 pub mod clipboard;
 pub mod config;
