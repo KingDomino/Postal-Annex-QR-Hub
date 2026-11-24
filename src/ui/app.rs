@@ -109,6 +109,7 @@ enum CardAction {
     Override,
     CopyAll,
     Reprint,
+    Reset,
 }
 
 /// The PostalAnnex+ Amazon QR Code Scanner application.
@@ -387,6 +388,24 @@ impl ScannerApp {
         self.copied_until = None;
         self.qr_error = None;
         self.cached_qr = None;
+    }
+
+    /// Clears all active scan state and returns the homepage to its initial Ready view.
+    fn reset_to_home(&mut self, now: Instant) {
+        self.state.reset();
+        self.scan_buffer.clear();
+        self.on_screen_changed(now);
+        self.print_error = None;
+        self.misc_error = None;
+    }
+
+    /// Returns `true` while scan input is arriving or the QR code is materializing.
+    fn is_generating(&self, now: Instant) -> bool {
+        !self.scan_buffer.is_empty()
+            || self
+                .cached_qr
+                .as_ref()
+                .is_some_and(|qr| !qr.anim.is_finished_at(now))
     }
 
     /// Executes effects immediately: prints are queued first (zero delay), then clipboard
@@ -709,6 +728,7 @@ impl ScannerApp {
                     let effects = self.state.trigger_reprint();
                     self.execute_effects(effects, ctx, now);
                 }
+                CardAction::Reset => self.reset_to_home(now),
             }
         }
     }
@@ -731,7 +751,7 @@ impl ScannerApp {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
             ui.vertical_centered(|ui| {
                 self.brand_header(ui);
-                ready_pill(ui);
+                status_pill(ui, self.is_generating(now));
                 if self.config.active_printer().is_none() {
                     ui.add_space(10.0);
                     if printer_notice(ui) {
@@ -804,6 +824,7 @@ impl ScannerApp {
         actions: &mut Vec<CardAction>,
     ) {
         let screen = self.state.screen().clone();
+        let is_ready = matches!(screen, ScreenState::Ready);
         let blink_visible = || {
             let (visible, until) = blink_phase(now.saturating_duration_since(self.screen_changed_at));
             ctx.request_repaint_after(until);
@@ -898,6 +919,22 @@ impl ScannerApp {
                 {
                     actions.push(CardAction::Reprint);
                 }
+            }
+        }
+
+        if !is_ready {
+            ui.add_space(10.0);
+            let reset_style = ButtonStyle::solid(WHITE, GRAY_150, TEXT_BODY).with_stroke(GRAY_400);
+            if flat_button(
+                ui,
+                egui::vec2(ui.available_width(), 36.0),
+                "Reset",
+                font_semibold(14.0),
+                reset_style,
+            )
+            .clicked()
+            {
+                actions.push(CardAction::Reset);
             }
         }
     }
@@ -1104,26 +1141,50 @@ fn blinking_title(ui: &mut Ui, text: &str, color: Color32, visible: bool) {
     wrapped(ui, text, font_bold(18.0), color);
 }
 
-/// "Ready to Scan" status pill — static live indicator (zero idle CPU).
-fn ready_pill(ui: &mut Ui) {
+fn status_pill_label(is_generating: bool) -> &'static str {
+    if is_generating {
+        "Generating Code"
+    } else {
+        "Ready to Scan"
+    }
+}
+
+/// Top scanner status pill — green "Ready to Scan" when idle, yellow "Generating Code" while scanning/animating.
+fn status_pill(ui: &mut Ui, is_generating: bool) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
     let painter = ui.painter();
-    painter.rect(rect, 8.0, READY_BG, Stroke::new(1.0_f32, READY_BORDER), StrokeKind::Inside);
+    let (bg, border, dot, text_color, halo_inner, halo_outer) = if is_generating {
+        (
+            Color32::from_rgb(0xff, 0xf9, 0xe6),
+            Color32::from_rgb(0xf5, 0xcf, 0x5c),
+            YELLOW,
+            NOTE_TEXT,
+            0.38,
+            0.20,
+        )
+    } else {
+        (READY_BG, READY_BORDER, GREEN, NAVY, 0.30, 0.16)
+    };
+    painter.rect(rect, 8.0, bg, Stroke::new(1.0_f32, border), StrokeKind::Inside);
 
-    let galley = painter.layout_no_wrap("Ready to Scan".to_owned(), font_bold(17.0), NAVY);
+    let galley = painter.layout_no_wrap(
+        status_pill_label(is_generating).to_owned(),
+        font_bold(17.0),
+        text_color,
+    );
     let halo_r = 9.0;
     let gap = 10.0;
     let total = 2.0 * halo_r + gap + galley.size().x;
     let x0 = rect.center().x - total * 0.5;
     let dot_center = egui::pos2(x0 + halo_r, rect.center().y);
-    painter.circle_filled(dot_center, halo_r, GREEN.gamma_multiply(0.16));
-    painter.circle_filled(dot_center, 6.5, GREEN.gamma_multiply(0.30));
-    painter.circle_filled(dot_center, 4.5, GREEN);
+    painter.circle_filled(dot_center, halo_r, dot.gamma_multiply(halo_outer));
+    painter.circle_filled(dot_center, 6.5, dot.gamma_multiply(halo_inner));
+    painter.circle_filled(dot_center, 4.5, dot);
     let text_pos = egui::pos2(x0 + 2.0 * halo_r + gap, rect.center().y - galley.size().y * 0.5);
-    painter.galley(text_pos, galley, NAVY);
+    painter.galley(text_pos, galley, text_color);
 }
 
 /// Amber "No thermal printer configured" notice. Returns `true` if "Open Settings" clicked.
@@ -1362,5 +1423,11 @@ mod tests {
         assert!(HAPPY_RETURN_QUESTION.starts_with("This appears to be a Happy Return"));
         assert!(CUSTOMER_PACKED_QUESTION.starts_with("This item is marked as customer packed"));
         assert_eq!(HAPPY_RETURN_NOTE, "Please try this return in PostalMate first.");
+    }
+
+    #[test]
+    fn status_pill_label_reflects_generating_state() {
+        assert_eq!(status_pill_label(false), "Ready to Scan");
+        assert_eq!(status_pill_label(true), "Generating Code");
     }
 }

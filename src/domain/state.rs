@@ -338,6 +338,12 @@ impl ScannerStateMachine {
         }
     }
 
+    /// Resets the scanner state back to [`ScreenState::Ready`] and clears the last print job.
+    pub fn reset(&mut self) {
+        self.screen = ScreenState::Ready;
+        self.last_print_job = None;
+    }
+
     fn next_scan_nonce(&mut self) -> u64 {
         self.scan_nonce = self.scan_nonce.wrapping_add(1);
         self.scan_nonce
@@ -587,5 +593,34 @@ mod tests {
         // Whitespace scan does NOT flush LabelReady or last_print_job
         assert!(sm.handle_scan("").is_empty());
         assert!(sm.last_print_job().is_some());
+    }
+
+    #[test]
+    fn reset_returns_to_ready_and_clears_last_print_job() {
+        let mut sm = ScannerStateMachine::new();
+
+        // From LabelReady
+        sm.handle_scan("AFNLFBF|RMA777|TAIL");
+        assert!(matches!(sm.screen(), ScreenState::LabelReady { .. }));
+        assert!(sm.last_print_job().is_some());
+        sm.reset();
+        assert_eq!(sm.screen(), &ScreenState::Ready);
+        assert!(sm.last_print_job().is_none());
+        assert!(sm.trigger_reprint().is_empty());
+        assert!(sm.trigger_copy_all().is_empty());
+
+        // From AwaitingPrompt
+        sm.handle_scan("AFNLF|RMA888|TAIL");
+        assert!(matches!(sm.screen(), ScreenState::AwaitingPrompt(_)));
+        sm.reset();
+        assert_eq!(sm.screen(), &ScreenState::Ready);
+        assert!(sm.last_print_job().is_none());
+
+        // From UnrecognizedWarning
+        sm.handle_scan("RANDOM_DATA");
+        assert!(matches!(sm.screen(), ScreenState::UnrecognizedWarning { .. }));
+        sm.reset();
+        assert_eq!(sm.screen(), &ScreenState::Ready);
+        assert!(sm.last_print_job().is_none());
     }
 }
