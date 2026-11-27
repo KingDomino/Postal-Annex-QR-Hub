@@ -125,6 +125,9 @@ pub struct ScannerApp {
 
     cached_qr: Option<CachedQr>,
     qr_error: Option<String>,
+    /// Whether Settings shows the update-channel picker; decided on the first Settings
+    /// frame (Shift held while opening) so store staff don't switch channels by accident.
+    pub(super) show_channel_picker: Option<bool>,
     copied_until: Option<Instant>,
     screen_changed_at: Instant,
     pending_prints: VecDeque<PrintOrigin>,
@@ -188,7 +191,12 @@ impl ScannerApp {
 
         print_worker.refresh_printers();
         if config.auto_check_updates {
-            update_worker.check(config.github_repo.clone(), true, Some(Duration::from_secs(1)));
+            update_worker.check(
+                config.github_repo.clone(),
+                config.update_channel,
+                true,
+                Some(Duration::from_secs(1)),
+            );
         }
         if auto_open_whats_new {
             update_worker.fetch_changelog(
@@ -206,6 +214,7 @@ impl ScannerApp {
             update_worker,
             cached_qr: None,
             qr_error: None,
+            show_channel_picker: None,
             copied_until: None,
             screen_changed_at: Instant::now(),
             pending_prints: VecDeque::new(),
@@ -240,6 +249,7 @@ impl ScannerApp {
     }
 
     pub(super) fn open_settings(&mut self) {
+        self.show_channel_picker = None;
         self.whats_new_open = false;
         self.settings_open = true;
         self.scan_buffer.clear();
@@ -295,7 +305,12 @@ impl ScannerApp {
     pub(super) fn check_for_updates(&mut self) {
         self.update_phase = UpdatePhase::Checking;
         self.update_worker
-            .check(self.config.github_repo.trim().to_string(), false, None);
+            .check(
+                self.config.github_repo.trim().to_string(),
+                self.config.update_channel,
+                false,
+                None,
+            );
     }
 
     pub(super) fn start_update_install(&mut self) {

@@ -7,7 +7,7 @@ use eframe::egui::{
     ScrollArea, Slider, Spinner, TextEdit, Ui,
 };
 
-use postal_annex_qr_scanner::config::AppConfig;
+use postal_annex_qr_scanner::config::{AppConfig, UpdateChannel};
 use postal_annex_qr_scanner::installer;
 use postal_annex_qr_scanner::updater::{current_arch_label, CURRENT_VERSION};
 
@@ -24,6 +24,8 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context, now: Instant) {
     let mut open_whats_new = false;
     let mut config_changed_discrete = false;
     let mut config_changed_continuous = false;
+    let shift_held = ctx.input(|i| i.modifiers.shift);
+    app.show_channel_picker.get_or_insert(shift_held);
 
     let max_body_height = (ctx.screen_rect().height() - 150.0).clamp(180.0, 520.0);
 
@@ -437,6 +439,46 @@ fn updates_section(
         .changed()
     {
         *changed_discrete = true;
+    }
+
+    // Hidden unless Settings was opened with Shift held (or this PC is already on Test,
+    // so it can always be switched back).
+    if app.show_channel_picker == Some(true) || app.config.update_channel == UpdateChannel::Test
+    {
+        let before = app.config.update_channel;
+        ui.horizontal(|ui| {
+            ui.add(
+                Label::new(
+                    RichText::new("Update channel:")
+                        .font(font_regular(13.0))
+                        .color(TEXT_BODY),
+                )
+                .selectable(false),
+            );
+            ComboBox::from_id_salt("update_channel")
+                .selected_text(match app.config.update_channel {
+                    UpdateChannel::Stable => "Stable",
+                    UpdateChannel::Test => "Test (pre-releases)",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut app.config.update_channel,
+                        UpdateChannel::Stable,
+                        "Stable",
+                    );
+                    ui.selectable_value(
+                        &mut app.config.update_channel,
+                        UpdateChannel::Test,
+                        "Test (pre-releases)",
+                    );
+                });
+        });
+        if app.config.update_channel != before {
+            *changed_discrete = true;
+            if !app.installing_update {
+                app.check_for_updates();
+            }
+        }
     }
 
     ui.horizontal(|ui| {

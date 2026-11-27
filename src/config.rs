@@ -27,9 +27,21 @@ pub struct AppConfig {
     pub offset_x_mm: f32,
     pub offset_y_mm: f32,
     pub auto_check_updates: bool,
+    pub update_channel: UpdateChannel,
     pub github_repo: String,
     #[serde(default)]
     pub last_seen_version: Option<String>,
+}
+
+/// Which GitHub releases the auto-updater follows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    /// Full releases only (every store PC).
+    #[default]
+    Stable,
+    /// Also pre-releases such as `v2.1.0-test.1` (for testing before promoting to stable).
+    Test,
 }
 
 impl Default for AppConfig {
@@ -44,6 +56,7 @@ impl Default for AppConfig {
             offset_x_mm: 0.0,
             offset_y_mm: 0.0,
             auto_check_updates: true,
+            update_channel: UpdateChannel::Stable,
             github_repo: DEFAULT_GITHUB_REPO.to_string(),
             last_seen_version: None,
         }
@@ -172,6 +185,10 @@ mod tests {
 
         let omitted: AppConfig = serde_json::from_str("{}").expect("should parse empty object");
         assert_eq!(omitted.last_seen_version, None);
+        // Configs from older versions have no channel and must stay on Stable.
+        assert_eq!(omitted.update_channel, UpdateChannel::Stable);
+        let test: AppConfig = serde_json::from_str(r#"{"update_channel":"test"}"#).unwrap();
+        assert_eq!(test.update_channel, UpdateChannel::Test);
     }
 
     #[test]
@@ -190,6 +207,7 @@ mod tests {
             offset_x_mm: -1.0,
             offset_y_mm: 2.5,
             auto_check_updates: false,
+            update_channel: UpdateChannel::Test,
             github_repo: "Example/Repo".to_string(),
             last_seen_version: Some("2.0.2".to_string()),
         };

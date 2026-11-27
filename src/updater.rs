@@ -11,13 +11,16 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::{config_dir, DEFAULT_GITHUB_REPO};
+use crate::config::{config_dir, UpdateChannel, DEFAULT_GITHUB_REPO};
 
 /// Current application version from `Cargo.toml`.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Embedded release notes for the current version, used as an offline fallback for "What's New?".
 pub const CURRENT_CHANGELOG: &str = "\
+- Added an update channel setting so a PC can test new versions before they are released to every store";
+
+const CHANGELOG_2_0_3: &str = "\
 - Statically linked the Windows C runtime to fix startup errors on clean Windows and ARM64 machines\n\
 - Updated \"What's New?\" to show all unread release changelogs with separate headers per version when skipping updates\n\
 - Updated Happy Returns printed label header to \"UPS Happy Returns\"\n\
@@ -33,7 +36,11 @@ const CHANGELOG_2_0_2: &str = "\
 
 /// Embedded release notes by version (newest first), used offline and when a release tag is not yet published.
 pub const EMBEDDED_CHANGELOGS: &[(&str, &str)] =
-    &[("2.0.3", CURRENT_CHANGELOG), ("2.0.2", CHANGELOG_2_0_2)];
+    &[
+        ("2.0.4", CURRENT_CHANGELOG),
+        ("2.0.3", CHANGELOG_2_0_3),
+        ("2.0.2", CHANGELOG_2_0_2),
+    ];
 
 /// A single version's changelog section shown inside the "What's New?" dialog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +95,15 @@ pub fn expected_asset_for_arch(arch: &str) -> Result<&'static str, String> {
         "aarch64" | "arm64" => Ok(ASSET_ARM64),
         other => Err(format!("Unsupported architecture for auto-update: {other}")),
     }
+}
+
+/// Returns the tag with the highest semantic version (unparseable tags are ignored).
+/// `2.1.0-test.1` sorts below `2.1.0`, so a promoted release always wins over its tests.
+pub fn newest_tag<'a>(tags: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    tags.into_iter()
+        .filter_map(|tag| Version::parse(strip_v_prefix(tag)).ok().map(|v| (v, tag)))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, tag)| tag)
 }
 
 /// Compares `current` version against a GitHub release `candidate_tag` (with or without leading `v`).
@@ -327,6 +343,7 @@ pub struct AvailableUpdate {
 pub enum UpdateCommand {
     Check {
         repo: String,
+        channel: UpdateChannel,
         silent: bool,
         initial_delay: Option<Duration>,
     },
@@ -380,6 +397,7 @@ impl UpdateWorker {
                     match cmd {
                         UpdateCommand::Check {
                             repo,
+                            channel,
                             silent,
                             initial_delay,
                         } => {
@@ -391,7 +409,7 @@ impl UpdateWorker {
                             if !emit(UpdateEvent::Checking) {
                                 break;
                             }
-                            run_check(&repo, silent, &emit);
+                            run_check(&repo, channel, silent, &emit);
                         }
                         UpdateCommand::Install(update) => {
                             run_install(&update, &emit);
@@ -420,9 +438,16 @@ impl UpdateWorker {
     }
 
     /// Triggers an asynchronous GitHub Releases check.
-    pub fn check(&self, repo: String, silent: bool, initial_delay: Option<Duration>) {
+    pub fn check(
+        &self,
+        repo: String,
+        channel: UpdateChannel,
+        silent: bool,
+        initial_delay: Option<Duration>,
+    ) {
         let _ = self.tx.send(UpdateCommand::Check {
             repo,
+            channel,
             silent,
             initial_delay,
         });
@@ -458,6 +483,8 @@ impl UpdateWorker {
 struct GithubRelease {
     tag_name: String,
     body: Option<String>,
+    #[serde(default)]
+    draft: bool,
     assets: Vec<GithubAsset>,
 }
 
@@ -474,7 +501,12 @@ fn user_agent() -> String {
 }
 
 #[cfg(feature = "online-updater")]
-fn run_check(repo: &str, silent: bool, emit: &dyn Fn(UpdateEvent) -> bool) {
+fn run_check(
+    repo: &str,
+    channel: UpdateChannel,
+    silent: bool,
+    emit: &dyn Fn(UpdateEvent) -> bool,
+) {
     let repo_trimmed = repo.trim();
     if repo_trimmed.is_empty() {
         let _ = emit(UpdateEvent::Error {
@@ -499,7 +531,16 @@ fn run_check(repo: &str, silent: bool, emit: &dyn Fn(UpdateEvent) -> bool) {
         }
     };
 
-    let url = format!("https://api.github.com/repos/{repo_trimmed}/releases/latest");
+    // Stable: GitHub's "latest release" never includes pre-releases.
+    // Test: the highest version among recent published releases, pre-releases included.
+    let url = match channel {
+        UpdateChannel::Stable => {
+            format!("https://api.github.com/repos/{repo_trimmed}/releases/latest")
+        }
+        UpdateChannel::Test => {
+            format!("https://api.github.com/repos/{repo_trimmed}/releases?per_page=20")
+        }
+    };
     let resp = match client.get(&url).send() {
         Ok(r) => r,
         Err(err) => {
@@ -519,7 +560,27 @@ fn run_check(repo: &str, silent: bool, emit: &dyn Fn(UpdateEvent) -> bool) {
         return;
     }
 
-    let release: GithubRelease = match resp.json() {
+    let parsed: Result<GithubRelease, String> = match channel {
+        UpdateChannel::Stable => resp.json().map_err(|err| err.to_string()),
+        UpdateChannel::Test => resp
+            .json::<Vec<GithubRelease>>()
+            .map_err(|err| err.to_string())
+            .and_then(|releases| {
+                let newest = newest_tag(
+                    releases
+                        .iter()
+                        .filter(|r| !r.draft)
+                        .map(|r| r.tag_name.as_str()),
+                )
+                .map(str::to_string)
+                .ok_or_else(|| "No published releases found.".to_string())?;
+                Ok(releases
+                    .into_iter()
+                    .find(|r| r.tag_name == newest)
+                    .expect("newest tag comes from this list"))
+            }),
+    };
+    let release = match parsed {
         Ok(r) => r,
         Err(err) => {
             let _ = emit(UpdateEvent::Error {
@@ -859,7 +920,12 @@ fn run_fetch_changelog(
 }
 
 #[cfg(not(feature = "online-updater"))]
-fn run_check(_repo: &str, silent: bool, emit: &dyn Fn(UpdateEvent) -> bool) {
+fn run_check(
+    _repo: &str,
+    _channel: UpdateChannel,
+    silent: bool,
+    emit: &dyn Fn(UpdateEvent) -> bool,
+) {
     let _ = emit(UpdateEvent::Error {
         message: "Online auto-updater is disabled in this build.".to_string(),
         silent,
@@ -920,10 +986,30 @@ mod tests {
 
     #[test]
     fn current_changelog_is_populated() {
-        assert!(CURRENT_CHANGELOG.contains("What's New?"));
-        assert!(CURRENT_CHANGELOG.contains("UPS Happy Returns"));
-        assert!(CURRENT_CHANGELOG.contains("UNPK-"));
-        assert!(CURRENT_CHANGELOG.contains("1Z"));
+        assert!(CURRENT_CHANGELOG.contains("update channel"));
+        assert!(CHANGELOG_2_0_3.contains("What's New?"));
+        assert!(CHANGELOG_2_0_3.contains("UPS Happy Returns"));
+        assert!(CHANGELOG_2_0_3.contains("UNPK-"));
+        assert!(CHANGELOG_2_0_3.contains("1Z"));
+        // Bumping Cargo.toml without adding notes would show stale notes under a new header.
+        assert_eq!(EMBEDDED_CHANGELOGS[0].0, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn newest_tag_orders_prereleases_below_their_release() {
+        let tags = ["v2.0.4", "v2.1.0-test.1", "v2.1.0-test.2", "not-a-version"];
+        assert_eq!(newest_tag(tags), Some("v2.1.0-test.2"));
+        assert_eq!(
+            newest_tag(["v2.1.0-test.2", "v2.1.0", "v2.0.4"]),
+            Some("v2.1.0")
+        );
+        assert_eq!(
+            newest_tag(["v2.1.0-test.10", "v2.1.0-test.9"]),
+            Some("v2.1.0-test.10")
+        );
+        assert_eq!(newest_tag([]), None);
+        assert!(is_newer_version("2.0.4", "v2.1.0-test.1").unwrap());
+        assert!(is_newer_version("2.1.0-test.2", "v2.1.0").unwrap());
     }
 
     #[test]
