@@ -2,16 +2,17 @@
 //! raw-data box, reprint, counter instructions, banners/toasts and the version footer.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, text::LayoutJob, Align, Align2, Color32, CursorIcon, Event, Frame, Key, Label, Layout,
-    Margin, Mesh, RichText, ScrollArea, Sense, Shadow, Shape, Stroke, StrokeKind, Ui, Vec2,
+    Margin, Mesh, ScrollArea, Sense, Shadow, Shape, Stroke, StrokeKind, Ui, Vec2,
 };
 
 use postal_annex_qr_scanner::clipboard;
-use postal_annex_qr_scanner::config::AppConfig;
+use postal_annex_qr_scanner::config::{AppConfig, LoadedConfig};
 use postal_annex_qr_scanner::domain::{
     AlertBadge, AppEffect, PrintJob, PrintTrigger, PromptKind, ScanBuffer, ScannerStateMachine,
     ScreenState,
@@ -29,11 +30,11 @@ use postal_annex_qr_scanner::updater::{
 
 use super::colors::*;
 use super::{
-    blink_phase, boxed, card_width, chrome, close_icon_button, flat_button, font_bold,
-    font_bold_italic, font_mono, font_regular, font_semibold, install_theme, overlay_button,
-    paint_dashed_rule, paint_gear, secondary_button_style, settings, snap_to_pixel,
-    text_button_width, text_format, whats_new, ButtonStyle, FontSupport, COPIED_FEEDBACK,
-    CONFIG_SAVE_DEBOUNCE, QR_PREVIEW_SIZE,
+    blink_phase, boxed, card_width, chrome, close_icon_button, download_progress_bar, flat_button,
+    font_bold, font_bold_italic, font_mono, font_regular, font_semibold, install_theme, label,
+    overlay_button, paint_dashed_rule, paint_gear, secondary_button_style, settings, snap_to_pixel,
+    text_button_width, text_format, whats_new, ButtonStyle, FontSupport, CONFIG_SAVE_DEBOUNCE,
+    COPIED_FEEDBACK, QR_PREVIEW_SIZE,
 };
 
 const HAPPY_RETURN_QUESTION: &str =
@@ -79,10 +80,16 @@ pub(super) enum UpdatePhase {
     Checking,
     UpToDate,
     Available,
-    Downloading { downloaded: u64, total: Option<u64> },
+    Downloading {
+        downloaded: u64,
+        total: Option<u64>,
+    },
     Verifying,
     ReadyToRestart,
+    /// The last update check failed.
     Error(String),
+    /// The last install attempt failed (offers Retry).
+    InstallFailed(String),
 }
 
 /// A dismissible, non-blocking red toast.
@@ -125,6 +132,8 @@ pub struct ScannerApp {
 
     cached_qr: Option<CachedQr>,
     qr_error: Option<String>,
+    /// The last clipboard write failed, so the scan's "Copied" badge would be wrong.
+    clipboard_failed: bool,
     copied_until: Option<Instant>,
     screen_changed_at: Instant,
     pending_prints: VecDeque<PrintOrigin>,
@@ -154,15 +163,14 @@ pub struct ScannerApp {
 
 impl ScannerApp {
     /// Builds the app: theme + fonts, config, background print/update workers.
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        just_installed: bool,
-        just_updated: bool,
-    ) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, just_installed: bool, just_updated: bool) -> Self {
         let ctx = cc.egui_ctx.clone();
         let fonts = install_theme(&ctx);
-        let (mut config, had_existing_config) = AppConfig::load_with_existing_flag();
-        let unread_since_version = config.last_seen_version.clone();
+        let LoadedConfig {
+            mut config,
+            existed: had_existing_config,
+            warning: config_warning,
+        } = AppConfig::load_with_existing_flag();
 
         let auto_open_whats_new = should_auto_open_whats_new(
             just_updated,
@@ -177,24 +185,33 @@ impl ScannerApp {
             config.last_seen_version = Some(CURRENT_VERSION.to_string());
             let _ = config.save();
         }
+        // Read after the fresh-install write above, so a manual "What's New?" on a fresh
+        // install shows only this version instead of every embedded changelog.
+        let unread_since_version = config.last_seen_version.clone();
 
         let whats_new_entries =
             updater::initial_unread_changelogs(unread_since_version.as_deref(), CURRENT_VERSION);
 
         let repaint_ctx = ctx.clone();
-        let repaint_cb: Arc<dyn Fn() + Send + Sync> = Arc::new(move || repaint_ctx.request_repaint());
+        let repaint_cb: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || repaint_ctx.request_repaint());
         let print_worker = PrintWorker::spawn(Some(Arc::clone(&repaint_cb)));
         let update_worker = UpdateWorker::spawn(Some(repaint_cb));
 
         print_worker.refresh_printers();
-        if config.auto_check_updates {
-            update_worker.check(config.github_repo.clone(), true, Some(Duration::from_secs(1)));
-        }
+        // Queue the changelog first: the worker is serial and the check waits 1 s.
         if auto_open_whats_new {
             update_worker.fetch_changelog(
                 config.github_repo.clone(),
                 unread_since_version.clone(),
                 CURRENT_VERSION.to_string(),
+            );
+        }
+        if config.auto_check_updates {
+            update_worker.check(
+                config.github_repo.clone(),
+                true,
+                Some(Duration::from_secs(1)),
             );
         }
 
@@ -206,6 +223,7 @@ impl ScannerApp {
             update_worker,
             cached_qr: None,
             qr_error: None,
+            clipboard_failed: false,
             copied_until: None,
             screen_changed_at: Instant::now(),
             pending_prints: VecDeque::new(),
@@ -226,7 +244,10 @@ impl ScannerApp {
             installed_banner_visible: just_installed,
             shortcut_feedback: None,
             print_error: None,
-            misc_error: None,
+            misc_error: config_warning.map(|message| ErrorToast {
+                title: "Settings reset",
+                message,
+            }),
             fonts,
         }
     }
@@ -234,10 +255,6 @@ impl ScannerApp {
     // -----------------------------------------------------------------------
     // Actions shared with modal overlays
     // -----------------------------------------------------------------------
-
-    fn is_modal_open(&self) -> bool {
-        self.settings_open || self.whats_new_open
-    }
 
     pub(super) fn open_settings(&mut self) {
         self.whats_new_open = false;
@@ -313,6 +330,27 @@ impl ScannerApp {
         }
     }
 
+    /// Creates the Desktop shortcut, recording feedback for the Settings panel.
+    pub(super) fn add_desktop_shortcut(&mut self) -> Result<(), String> {
+        self.record_shortcut_result(
+            installer::create_desktop_shortcut(),
+            "Desktop shortcut created.",
+        )
+    }
+
+    /// Stores a shortcut operation's outcome for display in Settings and passes it through.
+    pub(super) fn record_shortcut_result(
+        &mut self,
+        result: Result<PathBuf, String>,
+        success_message: &str,
+    ) -> Result<(), String> {
+        self.shortcut_feedback = Some(match &result {
+            Ok(_) => (false, success_message.to_string()),
+            Err(err) => (true, err.clone()),
+        });
+        result.map(|_| ())
+    }
+
     pub(super) fn save_config_now(&mut self) {
         if self.config_dirty_at.take().is_some() {
             match self.config.save() {
@@ -337,7 +375,7 @@ impl ScannerApp {
     fn poll_workers(&mut self, ctx: &egui::Context) {
         while let Some(event) = self.print_worker.try_recv() {
             match event {
-                PrintEvent::PrintSucceeded { .. } => {
+                PrintEvent::PrintSucceeded => {
                     match self.pending_prints.pop_front().unwrap_or(PrintOrigin::Scan) {
                         PrintOrigin::Scan => self.print_error = None,
                         PrintOrigin::Test => self.test_print = TestPrintStatus::Sent,
@@ -373,6 +411,12 @@ impl ScannerApp {
                     self.update_phase = UpdatePhase::Checking;
                 }
             }
+            // A check that finishes while an install is queued or running must not touch
+            // install state (the worker runs commands in order, so this does happen).
+            UpdateEvent::UpToDate { .. }
+            | UpdateEvent::Available(_)
+            | UpdateEvent::Error { .. }
+                if self.installing_update => {}
             UpdateEvent::UpToDate { .. } => {
                 self.update_phase = UpdatePhase::UpToDate;
                 self.available_update = None;
@@ -396,8 +440,9 @@ impl ScannerApp {
             }
             UpdateEvent::ChangelogsLoaded(entries) => {
                 if !entries.is_empty() {
-                    if let Some(current_entry) =
-                        entries.iter().find(|entry| entry.version == CURRENT_VERSION)
+                    if let Some(current_entry) = entries
+                        .iter()
+                        .find(|entry| entry.version == CURRENT_VERSION)
                     {
                         let _ = updater::save_cached_changelog(
                             &current_entry.version,
@@ -408,15 +453,16 @@ impl ScannerApp {
                 }
             }
             UpdateEvent::Error { message, silent } => {
-                if self.installing_update {
-                    self.installing_update = false;
-                    self.update_banner_dismissed = false;
-                    self.update_phase = UpdatePhase::Error(message);
-                } else if silent {
-                    self.update_phase = UpdatePhase::Idle;
+                self.update_phase = if silent {
+                    UpdatePhase::Idle
                 } else {
-                    self.update_phase = UpdatePhase::Error(message);
-                }
+                    UpdatePhase::Error(message)
+                };
+            }
+            UpdateEvent::InstallFailed(message) => {
+                self.installing_update = false;
+                self.update_banner_dismissed = false;
+                self.update_phase = UpdatePhase::InstallFailed(message);
             }
         }
     }
@@ -444,11 +490,9 @@ impl ScannerApp {
                     pressed: true,
                     modifiers: m,
                     ..
-                } => {
-                    if !(m.ctrl || m.command || m.alt) {
-                        if let Some(raw) = self.scan_buffer.submit(now) {
-                            self.process_submitted_scan(&raw, ctx, now);
-                        }
+                } if !(m.ctrl || m.command || m.alt) => {
+                    if let Some(raw) = self.scan_buffer.submit(now) {
+                        self.process_submitted_scan(&raw, ctx, now);
                     }
                 }
                 _ => {}
@@ -457,6 +501,12 @@ impl ScannerApp {
     }
 
     fn process_submitted_scan(&mut self, raw: &str, ctx: &egui::Context, now: Instant) {
+        if self.whats_new_open {
+            self.close_whats_new();
+        }
+        // SPEC §5.3: every new scan clears the previous scan's error banners.
+        self.print_error = None;
+        self.misc_error = None;
         let effects = self.state.handle_scan(raw);
         self.on_screen_changed(now);
         self.execute_effects(effects, ctx, now);
@@ -467,6 +517,7 @@ impl ScannerApp {
         self.screen_changed_at = now;
         self.copied_until = None;
         self.qr_error = None;
+        self.clipboard_failed = false;
         self.cached_qr = None;
     }
 
@@ -500,15 +551,13 @@ impl ScannerApp {
                 AppEffect::Print { job, trigger } => self.dispatch_print(job, trigger),
                 AppEffect::CopyToClipboard(text) => match clipboard::copy_text(&text) {
                     Ok(()) => {
-                        if self
-                            .misc_error
-                            .as_ref()
-                            .is_some_and(|t| t.title == CLIPBOARD_TOAST_TITLE)
-                        {
+                        self.clipboard_failed = false;
+                        if !self.last_clipboard_ok() {
                             self.misc_error = None;
                         }
                     }
                     Err(err) => {
+                        self.clipboard_failed = true;
                         self.misc_error = Some(ErrorToast {
                             title: CLIPBOARD_TOAST_TITLE,
                             message: err,
@@ -537,13 +586,13 @@ impl ScannerApp {
     }
 
     fn dispatch_print(&mut self, job: PrintJob, trigger: PrintTrigger) {
-        // Mirrors `PrintWorker::print_with_trigger` so FIFO origin tracking stays aligned.
-        if trigger == PrintTrigger::Auto && !self.config.auto_print_on_scan {
-            return;
+        // Track the origin only for queued jobs so FIFO result matching stays aligned.
+        if self
+            .print_worker
+            .print_with_trigger(job, trigger, self.config.clone())
+        {
+            self.pending_prints.push_back(PrintOrigin::Scan);
         }
-        self.pending_prints.push_back(PrintOrigin::Scan);
-        self.print_worker
-            .print_with_trigger(job, trigger, self.config.clone());
     }
 
     fn last_clipboard_ok(&self) -> bool {
@@ -628,15 +677,7 @@ impl ScannerApp {
                         }
 
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            ui.add(
-                                Label::new(
-                                    RichText::new(text)
-                                        .font(font_regular(10.0))
-                                        .color(FOOTER),
-                                )
-                                .truncate()
-                                .selectable(false),
-                            );
+                            ui.add(label(text, font_regular(10.0), FOOTER).truncate());
                         });
                     });
                 });
@@ -680,10 +721,24 @@ impl ScannerApp {
                         installed_banner(ui, &mut actions);
                     }
                     if let Some(message) = &self.print_error {
-                        error_toast(ui, "Print failed", message, true, &mut actions, BannerAction::DismissPrintError);
+                        error_toast(
+                            ui,
+                            "Print failed",
+                            message,
+                            true,
+                            &mut actions,
+                            BannerAction::DismissPrintError,
+                        );
                     }
                     if let Some(toast) = &self.misc_error {
-                        error_toast(ui, toast.title, &toast.message, false, &mut actions, BannerAction::DismissMiscError);
+                        error_toast(
+                            ui,
+                            toast.title,
+                            &toast.message,
+                            false,
+                            &mut actions,
+                            BannerAction::DismissMiscError,
+                        );
                     }
                 });
             });
@@ -692,18 +747,13 @@ impl ScannerApp {
             match action {
                 BannerAction::InstallUpdate => self.start_update_install(),
                 BannerAction::DismissUpdate => self.update_banner_dismissed = true,
-                BannerAction::AddDesktopShortcut => match installer::create_desktop_shortcut() {
-                    Ok(_) => {
-                        self.shortcut_feedback =
-                            Some((false, "Desktop shortcut created.".to_string()));
-                        self.installed_banner_visible = false;
-                    }
-                    Err(err) => {
+                BannerAction::AddDesktopShortcut => match self.add_desktop_shortcut() {
+                    Ok(()) => self.installed_banner_visible = false,
+                    Err(message) => {
                         self.misc_error = Some(ErrorToast {
                             title: "Shortcut failed",
-                            message: err.clone(),
+                            message,
                         });
-                        self.shortcut_feedback = Some((true, err));
                     }
                 },
                 BannerAction::DismissInstalled => self.installed_banner_visible = false,
@@ -734,14 +784,7 @@ impl ScannerApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         match &self.update_phase {
                             UpdatePhase::Downloading { downloaded, total } => {
-                                let fraction = total
-                                    .filter(|t| *t > 0)
-                                    .map(|t| (*downloaded as f32 / t as f32).clamp(0.0, 1.0));
-                                let bar = egui::ProgressBar::new(fraction.unwrap_or(0.0))
-                                    .desired_width(110.0)
-                                    .desired_height(10.0)
-                                    .fill(NAVY);
-                                ui.add(if fraction.is_some() { bar } else { bar.animate(true) });
+                                ui.add(download_progress_bar(*downloaded, *total, 110.0));
                                 banner_text(ui, &format!("Downloading update v{version}\u{2026}"));
                             }
                             UpdatePhase::Verifying => {
@@ -751,7 +794,7 @@ impl ScannerApp {
                             UpdatePhase::ReadyToRestart => {
                                 banner_text(ui, "Update installed \u{2014} restarting\u{2026}");
                             }
-                            UpdatePhase::Error(message) if !self.installing_update => {
+                            UpdatePhase::InstallFailed(message) => {
                                 if close_icon_button(ui, 22.0, UPDATE_TEXT, UPDATE_BORDER)
                                     .on_hover_text("Dismiss")
                                     .clicked()
@@ -904,7 +947,8 @@ impl ScannerApp {
         ui.add(Label::new(job).selectable(false));
         ui.add_space(5.0);
 
-        let (rule, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 2.0), Sense::hover());
+        let (rule, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 2.0), Sense::hover());
         ui.painter().rect_filled(rule, 0.0, NAVY);
         ui.add_space(6.0);
 
@@ -923,10 +967,11 @@ impl ScannerApp {
         now: Instant,
         actions: &mut Vec<CardAction>,
     ) {
-        let screen = self.state.screen().clone();
+        let screen = self.state.screen();
         let is_ready = matches!(screen, ScreenState::Ready);
         let blink_visible = || {
-            let (visible, until) = blink_phase(now.saturating_duration_since(self.screen_changed_at));
+            let (visible, until) =
+                blink_phase(now.saturating_duration_since(self.screen_changed_at));
             ctx.request_repaint_after(until);
             visible
         };
@@ -945,29 +990,51 @@ impl ScannerApp {
             }
             ScreenState::HappyReturnNote => {
                 ui.add_space(16.0);
-                boxed(ui, NOTE_BG, Stroke::new(1.0_f32, YELLOW), 6, Margin::symmetric(12, 9), |ui| {
-                    wrapped(ui, HAPPY_RETURN_NOTE, font_bold(13.0), NOTE_TEXT);
-                });
+                boxed(
+                    ui,
+                    NOTE_BG,
+                    Stroke::new(1.0_f32, YELLOW),
+                    6,
+                    Margin::symmetric(12, 9),
+                    |ui| {
+                        wrapped(ui, HAPPY_RETURN_NOTE, font_bold(13.0), NOTE_TEXT);
+                    },
+                );
             }
             ScreenState::PackingMaterialsNotice => {
                 ui.add_space(16.0);
                 let visible = blink_visible();
-                boxed(ui, DANGER_BG, Stroke::new(2.0_f32, DANGER_BORDER), 8, Margin::same(18), |ui| {
-                    blinking_title(ui, "NOTICE", RED, visible);
-                    ui.add_space(4.0);
-                    wrapped(ui, PACKING_NOTICE, font_bold(15.0), DANGER_TEXT);
-                });
+                boxed(
+                    ui,
+                    DANGER_BG,
+                    Stroke::new(2.0_f32, DANGER_BORDER),
+                    8,
+                    Margin::same(18),
+                    |ui| {
+                        blinking_title(ui, "NOTICE", RED, visible);
+                        ui.add_space(4.0);
+                        wrapped(ui, PACKING_NOTICE, font_bold(15.0), DANGER_TEXT);
+                    },
+                );
             }
             ScreenState::UnrecognizedWarning { .. } => {
                 ui.add_space(16.0);
                 let visible = blink_visible();
-                boxed(ui, NOTE_BG, Stroke::new(2.0_f32, YELLOW), 8, Margin::same(18), |ui| {
-                    blinking_title(ui, "WARNING!", AMBER_TEXT, visible);
-                    ui.add_space(4.0);
-                    wrapped(ui, UNRECOGNIZED_WARNING, font_bold(15.0), NOTE_TEXT);
-                });
+                boxed(
+                    ui,
+                    NOTE_BG,
+                    Stroke::new(2.0_f32, YELLOW),
+                    8,
+                    Margin::same(18),
+                    |ui| {
+                        blinking_title(ui, "WARNING!", AMBER_TEXT, visible);
+                        ui.add_space(4.0);
+                        wrapped(ui, UNRECOGNIZED_WARNING, font_bold(15.0), NOTE_TEXT);
+                    },
+                );
                 ui.add_space(14.0);
-                let style = ButtonStyle::solid(YELLOW, YELLOW_HOVER, TEXT_DARK).with_stroke(YELLOW_HOVER);
+                let style =
+                    ButtonStyle::solid(YELLOW, YELLOW_HOVER, TEXT_DARK).with_stroke(YELLOW_HOVER);
                 if flat_button(
                     ui,
                     egui::vec2(ui.available_width(), 44.0),
@@ -987,7 +1054,17 @@ impl ScannerApp {
                 ..
             } => {
                 ui.add_space(16.0);
-                if let Some(badge) = &badge {
+                if self.clipboard_failed {
+                    alert_badge(
+                        ui,
+                        &AlertBadge::Danger {
+                            text:
+                                "Nothing was copied (clipboard busy). Click Copy All to try again."
+                                    .to_string(),
+                        },
+                    );
+                    ui.add_space(18.0);
+                } else if let Some(badge) = &badge {
                     alert_badge(ui, badge);
                     ui.add_space(18.0);
                 } else {
@@ -1003,7 +1080,7 @@ impl ScannerApp {
                 }
                 self.qr_preview(ui, ctx, now);
                 ui.add_space(16.0);
-                if self.raw_data_box(ui, &payload, now) {
+                if self.raw_data_box(ui, payload, now) {
                     actions.push(CardAction::CopyAll);
                 }
                 ui.add_space(14.0);
@@ -1043,7 +1120,10 @@ impl ScannerApp {
         let size = ui.available_width().min(QR_PREVIEW_SIZE).floor();
         let (alloc, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
         let ppp = ctx.pixels_per_point();
-        let min = egui::pos2(snap_to_pixel(alloc.min.x, ppp), snap_to_pixel(alloc.min.y, ppp));
+        let min = egui::pos2(
+            snap_to_pixel(alloc.min.x, ppp),
+            snap_to_pixel(alloc.min.y, ppp),
+        );
         let rect = egui::Rect::from_min_size(min, Vec2::splat(size));
 
         if !ui.is_rect_visible(rect) {
@@ -1056,17 +1136,29 @@ impl ScannerApp {
             return;
         }
 
-        ui.painter()
-            .rect(rect, 0.0, WHITE, Stroke::new(1.0_f32, GRAY_200), StrokeKind::Outside);
+        ui.painter().rect(
+            rect,
+            0.0,
+            WHITE,
+            Stroke::new(1.0_f32, GRAY_200),
+            StrokeKind::Outside,
+        );
         let painter = ui.painter_at(rect);
 
         let Some(cached) = &self.cached_qr else {
-            if self.qr_error.is_some() {
+            if let Some(err) = &self.qr_error {
                 painter.text(
                     rect.center(),
                     Align2::CENTER_CENTER,
                     "QR preview unavailable",
                     font_semibold(13.0),
+                    MUTED,
+                );
+                painter.text(
+                    rect.center() + Vec2::new(0.0, 18.0),
+                    Align2::CENTER_CENTER,
+                    err,
+                    font_regular(11.0),
                     MUTED,
                 );
             }
@@ -1137,22 +1229,19 @@ impl ScannerApp {
                         .max_height(58.0)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            ui.add(
-                                Label::new(
-                                    RichText::new(payload).font(font_mono(12.0)).color(TEXT_BODY),
-                                )
-                                .wrap(),
-                            );
+                            ui.add(label(payload, font_mono(12.0), TEXT_BODY).wrap());
                         });
                 });
             });
 
         let box_rect = response.response.rect;
         let copied = self.copied_until.is_some_and(|until| now < until);
-        let (label, style) = if copied {
+        let (btn_label, style) = if copied {
             (
                 "Copied!",
-                ButtonStyle::solid(GREEN, GREEN, WHITE).with_stroke(GREEN).with_radius(4),
+                ButtonStyle::solid(GREEN, GREEN, WHITE)
+                    .with_stroke(GREEN)
+                    .with_radius(4),
             )
         } else {
             (
@@ -1167,13 +1256,26 @@ impl ScannerApp {
             egui::pos2(box_rect.right() - 8.0 - btn_w, box_rect.top() + 8.0),
             egui::vec2(btn_w, 24.0),
         );
-        overlay_button(ui, btn_rect, ui.id().with("copy_all"), label, font_bold(11.5), style).clicked()
+        overlay_button(
+            ui,
+            btn_rect,
+            ui.id().with("copy_all"),
+            btn_label,
+            font_bold(11.5),
+            style,
+        )
+        .clicked()
     }
 }
 
 const CLIPBOARD_TOAST_TITLE: &str = "Clipboard copy failed";
 
 impl eframe::App for ScannerApp {
+    /// Flushes debounced settings edits so closing the window right after a change keeps it.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_config_now();
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         egui::Rgba::from(WINDOW_BG).to_array()
     }
@@ -1183,7 +1285,8 @@ impl eframe::App for ScannerApp {
 
         self.poll_workers(ctx);
 
-        if !self.is_modal_open() {
+        // Only Settings pauses scan capture (SPEC §6.3); a scan closes What's New instead.
+        if !self.settings_open {
             Self::release_focus(ctx);
             self.capture_scan_input(ctx, now);
         }
@@ -1199,7 +1302,7 @@ impl eframe::App for ScannerApp {
         if self.whats_new_open {
             whats_new::show(self, ctx);
         }
-        if !self.is_modal_open() {
+        if !self.settings_open {
             Self::release_focus(ctx);
         }
 
@@ -1222,8 +1325,10 @@ fn should_auto_open_whats_new(
 }
 
 fn footer_label(version: &str, active_printer: Option<&str>) -> String {
-    let printer = active_printer
-        .map_or_else(|| "No Printer Configured".to_string(), |p| format!("Printer: {p}"));
+    let printer = active_printer.map_or_else(
+        || "No Printer Configured".to_string(),
+        |p| format!("Printer: {p}"),
+    );
     format!("QR Hub v{version}  \u{2022}  {printer}")
 }
 
@@ -1247,11 +1352,7 @@ fn centered_column<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 
 /// Centered, wrapped, non-selectable label.
 fn wrapped(ui: &mut Ui, text: &str, font: egui::FontId, color: Color32) {
-    ui.add(
-        Label::new(RichText::new(text).font(font).color(color))
-            .wrap()
-            .selectable(false),
-    );
+    ui.add(label(text, font, color).wrap());
 }
 
 fn blinking_title(ui: &mut Ui, text: &str, color: Color32, visible: bool) {
@@ -1286,7 +1387,13 @@ fn status_pill(ui: &mut Ui, is_generating: bool) {
     } else {
         (READY_BG, READY_BORDER, GREEN, NAVY, 0.30, 0.16)
     };
-    painter.rect(rect, 8.0, bg, Stroke::new(1.0_f32, border), StrokeKind::Inside);
+    painter.rect(
+        rect,
+        8.0,
+        bg,
+        Stroke::new(1.0_f32, border),
+        StrokeKind::Inside,
+    );
 
     let galley = painter.layout_no_wrap(
         status_pill_label(is_generating).to_owned(),
@@ -1301,73 +1408,136 @@ fn status_pill(ui: &mut Ui, is_generating: bool) {
     painter.circle_filled(dot_center, halo_r, dot.gamma_multiply(halo_outer));
     painter.circle_filled(dot_center, 6.5, dot.gamma_multiply(halo_inner));
     painter.circle_filled(dot_center, 4.5, dot);
-    let text_pos = egui::pos2(x0 + 2.0 * halo_r + gap, rect.center().y - galley.size().y * 0.5);
+    let text_pos = egui::pos2(
+        x0 + 2.0 * halo_r + gap,
+        rect.center().y - galley.size().y * 0.5,
+    );
     painter.galley(text_pos, galley, text_color);
 }
 
 /// Amber "No thermal printer configured" notice. Returns `true` if "Open Settings" clicked.
 fn printer_notice(ui: &mut Ui) -> bool {
     let mut clicked = false;
-    boxed(ui, NOTE_BG, Stroke::new(1.0_f32, YELLOW), 8, Margin::symmetric(12, 8), |ui| {
-        let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), Sense::hover());
-        let font = font_semibold(12.5);
-        let btn_w = text_button_width(ui, "Open Settings", font.clone(), 12.0);
-        let btn_rect = egui::Rect::from_min_size(
-            egui::pos2(row.right() - btn_w, row.top()),
-            egui::vec2(btn_w, row.height()),
-        );
-        ui.painter().text(
-            egui::pos2(row.left(), row.center().y),
-            Align2::LEFT_CENTER,
-            "No thermal printer configured",
-            font_semibold(13.0),
-            NOTE_TEXT,
-        );
-        let style = ButtonStyle::solid(WHITE, Color32::from_rgb(0xff, 0xe8, 0xa1), NOTE_TEXT)
-            .with_stroke(YELLOW);
-        clicked = overlay_button(ui, btn_rect, ui.id().with("printer_notice_settings"), "Open Settings", font, style)
+    boxed(
+        ui,
+        NOTE_BG,
+        Stroke::new(1.0_f32, YELLOW),
+        8,
+        Margin::symmetric(12, 8),
+        |ui| {
+            let (row, _) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), Sense::hover());
+            let font = font_semibold(12.5);
+            let btn_w = text_button_width(ui, "Open Settings", font.clone(), 12.0);
+            let btn_rect = egui::Rect::from_min_size(
+                egui::pos2(row.right() - btn_w, row.top()),
+                egui::vec2(btn_w, row.height()),
+            );
+            ui.painter().text(
+                egui::pos2(row.left(), row.center().y),
+                Align2::LEFT_CENTER,
+                "No thermal printer configured",
+                font_semibold(13.0),
+                NOTE_TEXT,
+            );
+            let style = ButtonStyle::solid(WHITE, Color32::from_rgb(0xff, 0xe8, 0xa1), NOTE_TEXT)
+                .with_stroke(YELLOW);
+            clicked = overlay_button(
+                ui,
+                btn_rect,
+                ui.id().with("printer_notice_settings"),
+                "Open Settings",
+                font,
+                style,
+            )
             .clicked();
-    });
+        },
+    );
     clicked
 }
 
 /// Shared Happy Return / Customer Packed prompt card. Returns `Some(yes)` when answered.
 fn prompt_box(ui: &mut Ui, question: &str) -> Option<bool> {
     let mut answer = None;
-    boxed(ui, GRAY_100, Stroke::new(2.0_f32, NAVY), 8, Margin::same(16), |ui| {
-        wrapped(ui, question, font_bold(14.0), NAVY);
-        ui.add_space(14.0);
-        let gap = 12.0;
-        let button_w = ((ui.available_width() - gap) * 0.5).floor();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            let size = egui::vec2(button_w, 42.0);
-            if flat_button(ui, size, "No", font_bold(14.0), ButtonStyle::solid(RED, RED_HOVER, WHITE))
+    boxed(
+        ui,
+        GRAY_100,
+        Stroke::new(2.0_f32, NAVY),
+        8,
+        Margin::same(16),
+        |ui| {
+            wrapped(ui, question, font_bold(14.0), NAVY);
+            ui.add_space(14.0);
+            let gap = 12.0;
+            let button_w = ((ui.available_width() - gap) * 0.5).floor();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                let size = egui::vec2(button_w, 42.0);
+                if flat_button(
+                    ui,
+                    size,
+                    "No",
+                    font_bold(14.0),
+                    ButtonStyle::solid(RED, RED_HOVER, WHITE),
+                )
                 .clicked()
-            {
-                answer = Some(false);
-            }
-            if flat_button(ui, size, "Yes", font_bold(14.0), ButtonStyle::solid(GREEN, GREEN_HOVER, WHITE))
+                {
+                    answer = Some(false);
+                }
+                if flat_button(
+                    ui,
+                    size,
+                    "Yes",
+                    font_bold(14.0),
+                    ButtonStyle::solid(GREEN, GREEN_HOVER, WHITE),
+                )
                 .clicked()
-            {
-                answer = Some(true);
-            }
-        });
-    });
+                {
+                    answer = Some(true);
+                }
+            });
+        },
+    );
     answer
 }
 
 fn alert_badge(ui: &mut Ui, badge: &AlertBadge) {
     match badge {
         AlertBadge::Green { text } => {
-            boxed(ui, GREEN, Stroke::NONE, 18, Margin::symmetric(20, 10), |ui| {
-                wrapped(ui, text, font_bold(14.0), WHITE);
-            });
+            boxed(
+                ui,
+                GREEN,
+                Stroke::NONE,
+                18,
+                Margin::symmetric(20, 10),
+                |ui| {
+                    wrapped(ui, text, font_bold(14.0), WHITE);
+                },
+            );
         }
         AlertBadge::Yellow { text } => {
-            boxed(ui, YELLOW, Stroke::NONE, 12, Margin::symmetric(16, 10), |ui| {
-                wrapped(ui, text, font_bold(13.5), TEXT_DARK);
-            });
+            boxed(
+                ui,
+                YELLOW,
+                Stroke::NONE,
+                12,
+                Margin::symmetric(16, 10),
+                |ui| {
+                    wrapped(ui, text, font_bold(13.5), TEXT_DARK);
+                },
+            );
+        }
+        AlertBadge::Danger { text } => {
+            boxed(
+                ui,
+                DANGER_BG,
+                Stroke::new(1.0_f32, DANGER_BORDER),
+                12,
+                Margin::symmetric(16, 10),
+                |ui| {
+                    wrapped(ui, text, font_bold(13.5), DANGER_TEXT);
+                },
+            );
         }
     }
 }
@@ -1388,11 +1558,7 @@ fn counter_instructions(ui: &mut Ui, ctx: &egui::Context) {
         ui.add(Label::new(title).selectable(false));
         ui.add_space(6.0);
         for line in COUNTER_INSTRUCTIONS {
-            ui.add(
-                Label::new(RichText::new(line).font(font_regular(12.0)).color(TEXT_BODY))
-                    .wrap()
-                    .selectable(false),
-            );
+            ui.add(label(line, font_regular(12.0), TEXT_BODY).wrap());
             ui.add_space(3.0);
         }
     });
@@ -1421,7 +1587,8 @@ fn installed_banner(ui: &mut Ui, actions: &mut Vec<BannerAction>) {
                         actions.push(BannerAction::DismissInstalled);
                     }
                     let btn_font = font_bold(12.0);
-                    let btn_w = text_button_width(ui, "Add Desktop Shortcut", btn_font.clone(), 12.0);
+                    let btn_w =
+                        text_button_width(ui, "Add Desktop Shortcut", btn_font.clone(), 12.0);
                     if flat_button(
                         ui,
                         egui::vec2(btn_w, 26.0),
@@ -1435,13 +1602,12 @@ fn installed_banner(ui: &mut Ui, actions: &mut Vec<BannerAction>) {
                     }
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.add(
-                            Label::new(
-                                RichText::new("Installed to Start Menu — launch anytime from Start.")
-                                    .font(font_semibold(12.5))
-                                    .color(text_color),
+                            label(
+                                "Installed to Start Menu — launch anytime from Start.",
+                                font_semibold(12.5),
+                                text_color,
                             )
-                            .truncate()
-                            .selectable(false),
+                            .truncate(),
                         );
                     });
                 });
@@ -1451,11 +1617,7 @@ fn installed_banner(ui: &mut Ui, actions: &mut Vec<BannerAction>) {
 
 fn banner_text(ui: &mut Ui, text: &str) -> egui::Response {
     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-        ui.add(
-            Label::new(RichText::new(text).font(font_semibold(13.0)).color(UPDATE_TEXT))
-                .truncate()
-                .selectable(false),
-        )
+        ui.add(label(text, font_semibold(13.0), UPDATE_TEXT).truncate())
     })
     .inner
 }
@@ -1490,10 +1652,7 @@ fn error_toast(
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.horizontal(|ui| {
-                ui.add(
-                    Label::new(RichText::new(title).font(font_bold(13.5)).color(DANGER_TEXT))
-                        .selectable(false),
-                );
+                ui.add(label(title, font_bold(13.5), DANGER_TEXT));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if close_icon_button(ui, 22.0, DANGER_TEXT, DANGER_BORDER)
                         .on_hover_text("Dismiss")
@@ -1514,11 +1673,7 @@ fn error_toast(
                     }
                 });
             });
-            ui.add(
-                Label::new(RichText::new(message).font(font_regular(12.5)).color(DANGER_TEXT))
-                    .wrap()
-                    .selectable(false),
-            );
+            ui.add(label(message, font_regular(12.5), DANGER_TEXT).wrap());
         });
 }
 
@@ -1540,7 +1695,10 @@ mod tests {
     fn prompt_texts_match_spec() {
         assert!(HAPPY_RETURN_QUESTION.starts_with("This appears to be a Happy Return"));
         assert!(CUSTOMER_PACKED_QUESTION.starts_with("This item is marked as customer packed"));
-        assert_eq!(HAPPY_RETURN_NOTE, "Please try this return in PostalMate first.");
+        assert_eq!(
+            HAPPY_RETURN_NOTE,
+            "Please try this return in PostalMate first."
+        );
     }
 
     #[test]
@@ -1555,12 +1713,27 @@ mod tests {
         assert!(!should_auto_open_whats_new(false, false, None, "2.0.2"));
         // Explicit --just-updated always opens.
         assert!(should_auto_open_whats_new(true, false, None, "2.0.2"));
-        assert!(should_auto_open_whats_new(true, true, Some("2.0.2"), "2.0.2"));
+        assert!(should_auto_open_whats_new(
+            true,
+            true,
+            Some("2.0.2"),
+            "2.0.2"
+        ));
         // Existing install upgraded from previous/untracked version opens once.
         assert!(should_auto_open_whats_new(false, true, None, "2.0.2"));
-        assert!(should_auto_open_whats_new(false, true, Some("2.0.1"), "2.0.2"));
+        assert!(should_auto_open_whats_new(
+            false,
+            true,
+            Some("2.0.1"),
+            "2.0.2"
+        ));
         // Normal subsequent launch on same version does not reopen.
-        assert!(!should_auto_open_whats_new(false, true, Some("2.0.2"), "2.0.2"));
+        assert!(!should_auto_open_whats_new(
+            false,
+            true,
+            Some("2.0.2"),
+            "2.0.2"
+        ));
     }
 
     #[test]

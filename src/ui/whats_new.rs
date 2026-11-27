@@ -2,16 +2,15 @@
 //! bottom pillbox "Close" button.
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, Frame, Id, Label, Layout, Margin, Modal, RichText,
-    ScrollArea, Stroke, Ui,
+    self, Align, Color32, CornerRadius, Frame, Id, Layout, Margin, Modal, ScrollArea, Stroke, Ui,
 };
 
-use postal_annex_qr_scanner::updater::{VersionChangelog, CURRENT_VERSION};
+use postal_annex_qr_scanner::updater::{strip_v_prefix, VersionChangelog, CURRENT_VERSION};
 
 use super::app::ScannerApp;
 use super::colors::*;
 use super::{
-    close_icon_button, flat_button, font_bold, font_regular, font_semibold, modal_frame,
+    close_icon_button, flat_button, font_bold, font_regular, font_semibold, label, modal_frame,
     ButtonStyle, MODAL_WIDTH,
 };
 
@@ -85,14 +84,7 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context) {
 
             // Header bar: title + version pill + close icon button.
             ui.horizontal(|ui| {
-                ui.add(
-                    Label::new(
-                        RichText::new("What's New?")
-                            .font(font_bold(18.0))
-                            .color(NAVY),
-                    )
-                    .selectable(false),
-                );
+                ui.add(label("What's New?", font_bold(18.0), NAVY));
 
                 version_pill(ui, CURRENT_VERSION);
 
@@ -141,21 +133,14 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context) {
 }
 
 fn version_pill(ui: &mut Ui, version: &str) {
-    let label = version.trim().trim_start_matches(['v', 'V']);
+    let version = strip_v_prefix(version);
     Frame::new()
         .fill(READY_BG)
         .stroke(Stroke::new(1.0_f32, READY_BORDER))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(8, 2))
         .show(ui, |ui| {
-            ui.add(
-                Label::new(
-                    RichText::new(format!("v{label}"))
-                        .font(font_bold(11.5))
-                        .color(NAVY),
-                )
-                .selectable(false),
-            );
+            ui.add(label(format!("v{version}"), font_bold(11.5), NAVY));
         });
 }
 
@@ -171,17 +156,11 @@ fn render_versions(ui: &mut Ui, entries: &[VersionChangelog]) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 version_pill(ui, &entry.version);
-                ui.add(
-                    Label::new(
-                        RichText::new(format!(
-                            "Changes in v{}",
-                            entry.version.trim().trim_start_matches(['v', 'V'])
-                        ))
-                        .font(font_semibold(13.5))
-                        .color(NAVY),
-                    )
-                    .selectable(false),
-                );
+                ui.add(label(
+                    format!("Changes in v{}", strip_v_prefix(&entry.version)),
+                    font_semibold(13.5),
+                    NAVY,
+                ));
             });
         }
         let parsed = parse_changelog_lines(&entry.notes);
@@ -196,44 +175,17 @@ fn render_changelog(ui: &mut Ui, lines: &[ChangelogLine]) {
                 if idx > 0 {
                     ui.add_space(4.0);
                 }
-                ui.add(
-                    Label::new(RichText::new(text).font(font_bold(13.5)).color(NAVY))
-                        .wrap()
-                        .selectable(false),
-                );
+                ui.add(label(text, font_bold(13.5), NAVY).wrap());
             }
             ChangelogLine::Bullet(text) => {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.add(
-                        Label::new(
-                            RichText::new("\u{2022}")
-                                .font(font_bold(13.5))
-                                .color(NAVY),
-                        )
-                        .selectable(false),
-                    );
-                    ui.add(
-                        Label::new(
-                            RichText::new(text)
-                                .font(font_regular(13.0))
-                                .color(TEXT_BODY),
-                        )
-                        .wrap()
-                        .selectable(false),
-                    );
+                    ui.add(label("\u{2022}", font_bold(13.5), NAVY));
+                    ui.add(label(text, font_regular(13.0), TEXT_BODY).wrap());
                 });
             }
             ChangelogLine::Paragraph(text) => {
-                ui.add(
-                    Label::new(
-                        RichText::new(text)
-                            .font(font_regular(13.0))
-                            .color(TEXT_BODY),
-                    )
-                    .wrap()
-                    .selectable(false),
-                );
+                ui.add(label(text, font_regular(13.0), TEXT_BODY).wrap());
             }
         }
     }
@@ -279,7 +231,9 @@ Plain paragraph line.
         let md = "\n   \n#hashtag is a paragraph\n##   \n-   \n";
         assert_eq!(
             parse_changelog_lines(md),
-            vec![ChangelogLine::Paragraph("#hashtag is a paragraph".to_string())]
+            vec![ChangelogLine::Paragraph(
+                "#hashtag is a paragraph".to_string()
+            )]
         );
     }
 }

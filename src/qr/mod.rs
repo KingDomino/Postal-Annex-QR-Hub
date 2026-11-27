@@ -15,11 +15,6 @@ pub struct QrMatrix {
 }
 
 impl QrMatrix {
-    /// Encodes `payload` into a QR matrix with Error Correction Level H (30% recovery).
-    pub fn encode(payload: &str) -> Result<Self, String> {
-        encode(payload)
-    }
-
     /// Returns `true` if the module at `(row, col)` is dark (`#000000`).
     /// Returns `false` if out of bounds.
     #[inline]
@@ -33,13 +28,16 @@ impl QrMatrix {
     /// Iterates over `(row, col)` coordinates of every dark module in row-major order.
     pub fn dark_modules(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         let width = self.width;
-        self.dark.iter().enumerate().filter_map(move |(idx, &is_dark)| {
-            if is_dark {
-                Some((idx / width, idx % width))
-            } else {
-                None
-            }
-        })
+        self.dark
+            .iter()
+            .enumerate()
+            .filter_map(move |(idx, &is_dark)| {
+                if is_dark {
+                    Some((idx / width, idx % width))
+                } else {
+                    None
+                }
+            })
     }
 
     /// Returns the total number of dark modules in the matrix.

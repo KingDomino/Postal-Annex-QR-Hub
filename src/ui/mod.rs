@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Frame,
-    InnerResponse, Margin, Painter, Pos2, Rect, Response, Sense, Shadow, Shape, Stroke, StrokeKind,
-    TextFormat, Ui, Vec2,
+    InnerResponse, Label, Margin, Painter, Pos2, ProgressBar, Rect, Response, RichText, Sense,
+    Shadow, Shape, Spinner, Stroke, StrokeKind, TextFormat, Ui, Vec2,
 };
 
 /// Brand and state palette (mirrors `app.html` / `SPEC.md`).
@@ -111,9 +111,7 @@ pub(crate) fn snap_to_pixel(value: f32, pixels_per_point: f32) -> f32 {
 
 /// Card width for a given available panel width.
 pub(crate) fn card_width(available: f32) -> f32 {
-    (available - 2.0 * CARD_MIN_SIDE_MARGIN)
-        .min(CARD_MAX_WIDTH)
-        .max(0.0)
+    (available - 2.0 * CARD_MIN_SIDE_MARGIN).clamp(0.0, CARD_MAX_WIDTH)
 }
 
 /// Formats a byte count as a short human-readable string.
@@ -246,8 +244,10 @@ fn install_fonts(ctx: &egui::Context) -> FontSupport {
         .insert(FontFamily::Name(FAMILY_SEMIBOLD.into()), semibold_list);
     defs.families
         .insert(FontFamily::Name(FAMILY_BOLD.into()), bold_list);
-    defs.families
-        .insert(FontFamily::Name(FAMILY_BOLD_ITALIC.into()), bold_italic_list);
+    defs.families.insert(
+        FontFamily::Name(FAMILY_BOLD_ITALIC.into()),
+        bold_italic_list,
+    );
 
     ctx.set_fonts(defs);
 
@@ -353,6 +353,39 @@ pub(crate) fn text_format(font: FontId, color: Color32, letter_spacing: f32) -> 
         extra_letter_spacing: letter_spacing,
         ..Default::default()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Small shared widgets
+// ---------------------------------------------------------------------------
+
+/// Non-selectable styled text label (chain `.wrap()` / `.truncate()` as needed).
+pub(crate) fn label(text: impl Into<String>, font: FontId, color: Color32) -> Label {
+    Label::new(RichText::new(text).font(font).color(color)).selectable(false)
+}
+
+/// Navy spinner followed by a short status message.
+pub(crate) fn spinner_row(ui: &mut Ui, message: &str, color: Color32) {
+    ui.horizontal(|ui| {
+        ui.add(Spinner::new().size(13.0).color(colors::NAVY));
+        ui.add(label(message, font_regular(12.0), color));
+    });
+}
+
+/// Download progress bar; animates when the total size is unknown.
+pub(crate) fn download_progress_bar(
+    downloaded: u64,
+    total: Option<u64>,
+    width: f32,
+) -> ProgressBar {
+    let fraction = total
+        .filter(|&t| t > 0)
+        .map(|t| (downloaded as f32 / t as f32).clamp(0.0, 1.0));
+    ProgressBar::new(fraction.unwrap_or(0.0))
+        .desired_width(width)
+        .desired_height(10.0)
+        .fill(colors::NAVY)
+        .animate(fraction.is_none())
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +549,13 @@ pub(crate) fn boxed<R>(
 }
 
 /// Vector gear icon (circle body + 8 teeth + center hole) — no emoji font dependency.
-pub(crate) fn paint_gear(painter: &Painter, center: Pos2, radius: f32, color: Color32, hole: Color32) {
+pub(crate) fn paint_gear(
+    painter: &Painter,
+    center: Pos2,
+    radius: f32,
+    color: Color32,
+    hole: Color32,
+) {
     const TEETH: usize = 8;
     let r_body = radius * 0.72;
     let r_root = radius * 0.62;
@@ -542,17 +581,28 @@ pub(crate) fn paint_gear(painter: &Painter, center: Pos2, radius: f32, color: Co
 pub(crate) fn paint_close_x(painter: &Painter, center: Pos2, half: f32, color: Color32) {
     let stroke = Stroke::new(1.6_f32, color);
     painter.line_segment(
-        [center + Vec2::new(-half, -half), center + Vec2::new(half, half)],
+        [
+            center + Vec2::new(-half, -half),
+            center + Vec2::new(half, half),
+        ],
         stroke,
     );
     painter.line_segment(
-        [center + Vec2::new(-half, half), center + Vec2::new(half, -half)],
+        [
+            center + Vec2::new(-half, half),
+            center + Vec2::new(half, -half),
+        ],
         stroke,
     );
 }
 
 /// Small round icon button with a vector "✕" (dismiss / close).
-pub(crate) fn close_icon_button(ui: &mut Ui, size: f32, color: Color32, hover_bg: Color32) -> Response {
+pub(crate) fn close_icon_button(
+    ui: &mut Ui,
+    size: f32,
+    color: Color32,
+    hover_bg: Color32,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::CLICK);
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {

@@ -2,13 +2,13 @@
 //! vector window controls, 8-way edge/corner resizing, and a subtle outer window border.
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, CursorIcon, Frame, Id, Label, LayerId, Layout, Margin,
-    Order, Painter, PointerButton, Pos2, Rect, ResizeDirection, RichText, Sense, Stroke,
-    StrokeKind, Vec2, ViewportCommand,
+    self, Align, Color32, CornerRadius, CursorIcon, Frame, Id, LayerId, Layout, Margin, Order,
+    Painter, PointerButton, Pos2, Rect, ResizeDirection, Sense, Stroke, StrokeKind, Vec2,
+    ViewportCommand,
 };
 
 use super::colors::*;
-use super::{font_semibold, snap_to_pixel};
+use super::{font_semibold, label, snap_to_pixel};
 
 /// Height of the custom borderless titlebar in logical pixels.
 pub(super) const TITLEBAR_HEIGHT: f32 = 34.0;
@@ -43,7 +43,10 @@ pub(super) fn show(ctx: &egui::Context) {
             let controls_width = CONTROL_BTN_WIDTH * 3.0;
             let drag_rect = Rect::from_min_max(
                 bar_rect.min,
-                Pos2::new((bar_rect.max.x - controls_width).max(bar_rect.min.x), bar_rect.max.y),
+                Pos2::new(
+                    (bar_rect.max.x - controls_width).max(bar_rect.min.x),
+                    bar_rect.max.y,
+                ),
             );
 
             // Non-focusable drag + double-click maximize region (excludes right control buttons).
@@ -52,8 +55,7 @@ pub(super) fn show(ctx: &egui::Context) {
                 ui.id().with("chrome_titlebar_drag"),
                 Sense::CLICK | Sense::DRAG,
             );
-            if active_resize_edge.is_none()
-                && drag_response.drag_started_by(PointerButton::Primary)
+            if active_resize_edge.is_none() && drag_response.drag_started_by(PointerButton::Primary)
             {
                 ctx.send_viewport_cmd(ViewportCommand::StartDrag);
             }
@@ -73,20 +75,16 @@ pub(super) fn show(ctx: &egui::Context) {
                     if ui.is_rect_visible(mark_rect) {
                         paint_mini_qr_mark(ui.painter(), mark_rect);
                     }
-                    ui.add(
-                        Label::new(
-                            RichText::new("QR Hub")
-                                .font(font_semibold(12.5))
-                                .color(NAVY),
-                        )
-                        .selectable(false),
-                    );
+                    ui.add(label("QR Hub", font_semibold(12.5), NAVY));
                 },
             );
 
             // Right: minimize, maximize/restore, and close buttons (Sense::CLICK only).
             let controls_rect = Rect::from_min_max(
-                Pos2::new((bar_rect.max.x - controls_width).max(bar_rect.min.x), bar_rect.min.y),
+                Pos2::new(
+                    (bar_rect.max.x - controls_width).max(bar_rect.min.x),
+                    bar_rect.min.y,
+                ),
                 bar_rect.max,
             );
             ui.allocate_new_ui(
@@ -215,7 +213,10 @@ fn window_control_button(
     is_close: bool,
     paint_glyph: impl FnOnce(&Painter, Rect, Color32, Color32),
 ) -> egui::Response {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(CONTROL_BTN_WIDTH, TITLEBAR_HEIGHT), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(CONTROL_BTN_WIDTH, TITLEBAR_HEIGHT),
+        Sense::hover(),
+    );
     let response = ui
         .interact(rect, ui.id().with(id_salt), Sense::CLICK)
         .on_hover_text(tooltip);
@@ -266,7 +267,10 @@ fn paint_mini_qr_mark(painter: &Painter, rect: Rect) {
     }
 
     // Tiny brand-red '+' in the bottom-right quadrant.
-    let plus_center = Pos2::new(rect.right() - pad - finder * 0.5, rect.bottom() - pad - finder * 0.5);
+    let plus_center = Pos2::new(
+        rect.right() - pad - finder * 0.5,
+        rect.bottom() - pad - finder * 0.5,
+    );
     let arm = 1.9;
     let stroke = Stroke::new(1.3_f32, BRAND_RED);
     painter.line_segment(
@@ -289,7 +293,10 @@ fn paint_minimize_glyph(painter: &Painter, center: Pos2, ppp: f32, color: Color3
     let y = snap_to_pixel(center.y + 0.5, ppp);
     let x0 = snap_to_pixel(center.x - 5.0, ppp);
     let x1 = snap_to_pixel(center.x + 5.0, ppp);
-    painter.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.25_f32, color));
+    painter.line_segment(
+        [Pos2::new(x0, y), Pos2::new(x1, y)],
+        Stroke::new(1.25_f32, color),
+    );
 }
 
 fn paint_maximize_glyph(painter: &Painter, center: Pos2, ppp: f32, color: Color32) {
@@ -344,11 +351,17 @@ fn paint_close_glyph(painter: &Painter, center: Pos2, ppp: f32, color: Color32) 
     let half = 4.5;
     let stroke = Stroke::new(1.3_f32, color);
     painter.line_segment(
-        [Pos2::new(cx - half, cy - half), Pos2::new(cx + half, cy + half)],
+        [
+            Pos2::new(cx - half, cy - half),
+            Pos2::new(cx + half, cy + half),
+        ],
         stroke,
     );
     painter.line_segment(
-        [Pos2::new(cx - half, cy + half), Pos2::new(cx + half, cy - half)],
+        [
+            Pos2::new(cx - half, cy + half),
+            Pos2::new(cx + half, cy - half),
+        ],
         stroke,
     );
 }
@@ -362,14 +375,38 @@ mod tests {
         let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(460.0, 740.0));
         let b = RESIZE_BORDER_PX;
 
-        assert_eq!(resize_direction_at(rect, Pos2::new(2.0, 2.0), b), Some(ResizeDirection::NorthWest));
-        assert_eq!(resize_direction_at(rect, Pos2::new(458.0, 2.0), b), Some(ResizeDirection::NorthEast));
-        assert_eq!(resize_direction_at(rect, Pos2::new(2.0, 738.0), b), Some(ResizeDirection::SouthWest));
-        assert_eq!(resize_direction_at(rect, Pos2::new(458.0, 738.0), b), Some(ResizeDirection::SouthEast));
-        assert_eq!(resize_direction_at(rect, Pos2::new(230.0, 1.0), b), Some(ResizeDirection::North));
-        assert_eq!(resize_direction_at(rect, Pos2::new(230.0, 739.0), b), Some(ResizeDirection::South));
-        assert_eq!(resize_direction_at(rect, Pos2::new(3.0, 350.0), b), Some(ResizeDirection::West));
-        assert_eq!(resize_direction_at(rect, Pos2::new(457.0, 350.0), b), Some(ResizeDirection::East));
+        assert_eq!(
+            resize_direction_at(rect, Pos2::new(2.0, 2.0), b),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(
+            resize_direction_at(rect, Pos2::new(458.0, 2.0), b),
+            Some(ResizeDirection::NorthEast)
+        );
+        assert_eq!(
+            resize_direction_at(rect, Pos2::new(2.0, 738.0), b),
+            Some(ResizeDirection::SouthWest)
+        );
+        assert_eq!(
+            resize_direction_at(rect, Pos2::new(458.0, 738.0), b),
+            Some(ResizeDirection::SouthEast)
+        );
+        assert_eq!(
+            resize_direction_at(rect, Pos2::new(230.0, 1.0), b),
+            Some(ResizeDirection::North)
+        );
+        assert_eq!(
+            resize_direction_at(rect, Pos2::new(230.0, 739.0), b),
+            Some(ResizeDirection::South)
+        );
+        assert_eq!(
+            resize_direction_at(rect, Pos2::new(3.0, 350.0), b),
+            Some(ResizeDirection::West)
+        );
+        assert_eq!(
+            resize_direction_at(rect, Pos2::new(457.0, 350.0), b),
+            Some(ResizeDirection::East)
+        );
         // Interior and outside points do not trigger resize.
         assert_eq!(resize_direction_at(rect, Pos2::new(230.0, 350.0), b), None);
         assert_eq!(resize_direction_at(rect, Pos2::new(-1.0, 10.0), b), None);
@@ -378,13 +415,31 @@ mod tests {
 
     #[test]
     fn resize_cursor_maps_every_direction() {
-        assert_eq!(resize_cursor(ResizeDirection::North), CursorIcon::ResizeNorth);
-        assert_eq!(resize_cursor(ResizeDirection::South), CursorIcon::ResizeSouth);
+        assert_eq!(
+            resize_cursor(ResizeDirection::North),
+            CursorIcon::ResizeNorth
+        );
+        assert_eq!(
+            resize_cursor(ResizeDirection::South),
+            CursorIcon::ResizeSouth
+        );
         assert_eq!(resize_cursor(ResizeDirection::East), CursorIcon::ResizeEast);
         assert_eq!(resize_cursor(ResizeDirection::West), CursorIcon::ResizeWest);
-        assert_eq!(resize_cursor(ResizeDirection::NorthWest), CursorIcon::ResizeNorthWest);
-        assert_eq!(resize_cursor(ResizeDirection::NorthEast), CursorIcon::ResizeNorthEast);
-        assert_eq!(resize_cursor(ResizeDirection::SouthWest), CursorIcon::ResizeSouthWest);
-        assert_eq!(resize_cursor(ResizeDirection::SouthEast), CursorIcon::ResizeSouthEast);
+        assert_eq!(
+            resize_cursor(ResizeDirection::NorthWest),
+            CursorIcon::ResizeNorthWest
+        );
+        assert_eq!(
+            resize_cursor(ResizeDirection::NorthEast),
+            CursorIcon::ResizeNorthEast
+        );
+        assert_eq!(
+            resize_cursor(ResizeDirection::SouthWest),
+            CursorIcon::ResizeSouthWest
+        );
+        assert_eq!(
+            resize_cursor(ResizeDirection::SouthEast),
+            CursorIcon::ResizeSouthEast
+        );
     }
 }

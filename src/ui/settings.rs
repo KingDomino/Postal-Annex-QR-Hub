@@ -3,8 +3,7 @@
 use std::time::Instant;
 
 use eframe::egui::{
-    self, Align, Color32, ComboBox, DragValue, Id, Label, Layout, Modal, ProgressBar, RichText,
-    ScrollArea, Slider, Spinner, TextEdit, Ui,
+    self, Align, Color32, ComboBox, DragValue, Id, Layout, Modal, ScrollArea, Slider, TextEdit, Ui,
 };
 
 use postal_annex_qr_scanner::config::AppConfig;
@@ -14,8 +13,9 @@ use postal_annex_qr_scanner::updater::{current_arch_label, CURRENT_VERSION};
 use super::app::{ScannerApp, TestPrintStatus, UpdatePhase};
 use super::colors::*;
 use super::{
-    close_icon_button, flat_button, font_bold, font_regular, font_semibold, format_bytes,
-    modal_frame, secondary_button_style, text_button_width, ButtonStyle, MODAL_WIDTH,
+    close_icon_button, download_progress_bar, flat_button, font_bold, font_regular, font_semibold,
+    format_bytes, label, modal_frame, secondary_button_style, spinner_row, text_button_width,
+    ButtonStyle, MODAL_WIDTH,
 };
 
 /// Renders the centered Settings modal over a click-blocking backdrop scrim.
@@ -36,14 +36,7 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context, now: Instant) {
 
             // Header bar
             ui.horizontal(|ui| {
-                ui.add(
-                    Label::new(
-                        RichText::new("Settings")
-                            .font(font_bold(18.0))
-                            .color(NAVY),
-                    )
-                    .selectable(false),
-                );
+                ui.add(label("Settings", font_bold(18.0), NAVY));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if close_icon_button(ui, 26.0, MUTED, GRAY_150)
                         .on_hover_text("Close (Esc)")
@@ -97,13 +90,12 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context, now: Instant) {
             ui.horizontal(|ui| {
                 if let Some(err) = &app.config_error {
                     ui.add(
-                        Label::new(
-                            RichText::new(format!("Save error: {err}"))
-                                .font(font_regular(11.0))
-                                .color(DANGER_TEXT),
+                        label(
+                            format!("Save error: {err}"),
+                            font_regular(11.0),
+                            DANGER_TEXT,
                         )
-                        .truncate()
-                        .selectable(false),
+                        .truncate(),
                     )
                     .on_hover_text(err.as_str());
                 }
@@ -141,14 +133,7 @@ pub(super) fn show(app: &mut ScannerApp, ctx: &egui::Context, now: Instant) {
 }
 
 fn section_heading(ui: &mut Ui, title: &str) {
-    ui.add(
-        Label::new(
-            RichText::new(title)
-                .font(font_bold(12.0))
-                .color(NAVY),
-        )
-        .selectable(false),
-    );
+    ui.add(label(title, font_bold(12.0), NAVY));
 }
 
 fn printer_section(app: &mut ScannerApp, ui: &mut Ui, changed: &mut bool) {
@@ -180,14 +165,17 @@ fn printer_section(app: &mut ScannerApp, ui: &mut Ui, changed: &mut bool) {
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
                 let is_none = app.config.active_printer().is_none();
-                if ui.selectable_label(is_none, "(No printer selected)").clicked() {
+                if ui
+                    .selectable_label(is_none, "(No printer selected)")
+                    .clicked()
+                {
                     app.config.printer_name = None;
                     *changed = true;
                 }
                 if let Some(name) = &current_name {
                     if current_offline {
-                        let label = format!("{name} (offline)");
-                        if ui.selectable_label(true, label).clicked() {
+                        let offline_label = format!("{name} (offline)");
+                        if ui.selectable_label(true, offline_label).clicked() {
                             app.config.printer_name = Some(name.clone());
                         }
                     }
@@ -217,27 +205,9 @@ fn printer_section(app: &mut ScannerApp, ui: &mut Ui, changed: &mut bool) {
     });
 
     if app.printers_refreshing {
-        ui.horizontal(|ui| {
-            ui.add(Spinner::new().size(13.0).color(NAVY));
-            ui.add(
-                Label::new(
-                    RichText::new("Scanning installed printers\u{2026}")
-                        .font(font_regular(12.0))
-                        .color(MUTED),
-                )
-                .selectable(false),
-            );
-        });
+        spinner_row(ui, "Scanning installed printers\u{2026}", MUTED);
     } else if let Some(err) = &app.printers_error {
-        ui.add(
-            Label::new(
-                RichText::new(err)
-                    .font(font_regular(12.0))
-                    .color(DANGER_TEXT),
-            )
-            .wrap()
-            .selectable(false),
-        );
+        ui.add(label(err, font_regular(12.0), DANGER_TEXT).wrap());
     }
 
     if ui
@@ -270,38 +240,19 @@ fn printer_section(app: &mut ScannerApp, ui: &mut Ui, changed: &mut bool) {
     match &app.test_print {
         TestPrintStatus::Idle => {}
         TestPrintStatus::Sending => {
-            ui.horizontal(|ui| {
-                ui.add(Spinner::new().size(13.0).color(NAVY));
-                ui.add(
-                    Label::new(
-                        RichText::new("Sending 4\" x 6\" test label to spooler\u{2026}")
-                            .font(font_regular(12.0))
-                            .color(MUTED),
-                    )
-                    .selectable(false),
-                );
-            });
+            spinner_row(ui, "Sending 4\" x 6\" test label to spooler\u{2026}", MUTED);
         }
         TestPrintStatus::Sent => {
-            ui.add(
-                Label::new(
-                    RichText::new("Test label sent to printer.")
-                        .font(font_semibold(12.0))
-                        .color(GREEN),
-                )
-                .wrap()
-                .selectable(false),
-            );
+            ui.add(label("Test label sent to printer.", font_semibold(12.0), GREEN).wrap());
         }
         TestPrintStatus::Failed(msg) => {
             ui.add(
-                Label::new(
-                    RichText::new(format!("Test print failed: {msg}"))
-                        .font(font_regular(12.0))
-                        .color(DANGER_TEXT),
+                label(
+                    format!("Test print failed: {msg}"),
+                    font_regular(12.0),
+                    DANGER_TEXT,
                 )
-                .wrap()
-                .selectable(false),
+                .wrap(),
             );
         }
     }
@@ -327,14 +278,7 @@ fn calibration_section(
     }
 
     ui.horizontal(|ui| {
-        ui.add(
-            Label::new(
-                RichText::new("QR Size:")
-                    .font(font_regular(13.0))
-                    .color(TEXT_BODY),
-            )
-            .selectable(false),
-        );
+        ui.add(label("QR Size:", font_regular(13.0), TEXT_BODY));
         let slider = Slider::new(&mut app.config.qr_size_inches, 2.0..=3.5)
             .step_by(0.025)
             .fixed_decimals(3)
@@ -345,14 +289,7 @@ fn calibration_section(
     });
 
     ui.horizontal(|ui| {
-        ui.add(
-            Label::new(
-                RichText::new("Offset X:")
-                    .font(font_regular(13.0))
-                    .color(TEXT_BODY),
-            )
-            .selectable(false),
-        );
+        ui.add(label("Offset X:", font_regular(13.0), TEXT_BODY));
         if ui
             .add(
                 DragValue::new(&mut app.config.offset_x_mm)
@@ -368,14 +305,7 @@ fn calibration_section(
 
         ui.add_space(14.0);
 
-        ui.add(
-            Label::new(
-                RichText::new("Offset Y:")
-                    .font(font_regular(13.0))
-                    .color(TEXT_BODY),
-            )
-            .selectable(false),
-        );
+        ui.add(label("Offset Y:", font_regular(13.0), TEXT_BODY));
         if ui
             .add(
                 DragValue::new(&mut app.config.offset_y_mm)
@@ -416,17 +346,14 @@ fn updates_section(
     section_heading(ui, "UPDATES & INFO");
 
     ui.horizontal(|ui| {
-        ui.add(
-            Label::new(
-                RichText::new(format!(
-                    "Version: v{CURRENT_VERSION}   \u{2022}   Architecture: {}",
-                    current_arch_label()
-                ))
-                .font(font_regular(12.5))
-                .color(MUTED),
-            )
-            .selectable(false),
-        );
+        ui.add(label(
+            format!(
+                "Version: v{CURRENT_VERSION}   \u{2022}   Architecture: {}",
+                current_arch_label()
+            ),
+            font_regular(12.5),
+            MUTED,
+        ));
     });
 
     if ui
@@ -440,14 +367,7 @@ fn updates_section(
     }
 
     ui.horizontal(|ui| {
-        ui.add(
-            Label::new(
-                RichText::new("GitHub Repo:")
-                    .font(font_regular(13.0))
-                    .color(TEXT_BODY),
-            )
-            .selectable(false),
-        );
+        ui.add(label("GitHub Repo:", font_regular(13.0), TEXT_BODY));
         let edit = TextEdit::singleline(&mut app.config.github_repo)
             .desired_width(ui.available_width())
             .hint_text("owner/repo");
@@ -521,109 +441,54 @@ fn updates_section(
     match &app.update_phase {
         UpdatePhase::Idle => {}
         UpdatePhase::Checking => {
-            ui.horizontal(|ui| {
-                ui.add(Spinner::new().size(13.0).color(NAVY));
-                ui.add(
-                    Label::new(
-                        RichText::new("Checking GitHub Releases\u{2026}")
-                            .font(font_regular(12.0))
-                            .color(MUTED),
-                    )
-                    .selectable(false),
-                );
-            });
+            spinner_row(ui, "Checking GitHub Releases\u{2026}", MUTED);
         }
         UpdatePhase::UpToDate => {
-            ui.add(
-                Label::new(
-                    RichText::new("Up to date.")
-                        .font(font_semibold(12.0))
-                        .color(GREEN),
-                )
-                .selectable(false),
-            );
+            ui.add(label("Up to date.", font_semibold(12.0), GREEN));
         }
         UpdatePhase::Available => {
             if let Some(update) = &app.available_update {
                 ui.add(
-                    Label::new(
-                        RichText::new(format!(
+                    label(
+                        format!(
                             "Update available: v{} ({})",
                             update.version, update.asset_name
-                        ))
-                        .font(font_semibold(12.5))
-                        .color(NAVY),
+                        ),
+                        font_semibold(12.5),
+                        NAVY,
                     )
-                    .wrap()
-                    .selectable(false),
+                    .wrap(),
                 );
             }
         }
         UpdatePhase::Downloading { downloaded, total } => {
-            let fraction = total
-                .filter(|t| *t > 0)
-                .map(|t| (*downloaded as f32 / t as f32).clamp(0.0, 1.0));
             let progress_text = match total {
-                Some(t) if *t > 0 => {
-                    format!(
-                        "Downloading: {} / {}",
-                        format_bytes(*downloaded),
-                        format_bytes(*t)
-                    )
-                }
+                Some(t) if *t > 0 => format!(
+                    "Downloading: {} / {}",
+                    format_bytes(*downloaded),
+                    format_bytes(*t)
+                ),
                 _ => format!("Downloading: {}", format_bytes(*downloaded)),
             };
-            ui.add(
-                Label::new(
-                    RichText::new(progress_text)
-                        .font(font_regular(12.0))
-                        .color(UPDATE_TEXT),
-                )
-                .selectable(false),
-            );
-            let bar = ProgressBar::new(fraction.unwrap_or(0.0))
-                .desired_width(ui.available_width())
-                .desired_height(10.0)
-                .fill(NAVY);
-            ui.add(if fraction.is_some() {
-                bar
-            } else {
-                bar.animate(true)
-            });
+            ui.add(label(progress_text, font_regular(12.0), UPDATE_TEXT));
+            ui.add(download_progress_bar(
+                *downloaded,
+                *total,
+                ui.available_width(),
+            ));
         }
         UpdatePhase::Verifying => {
-            ui.horizontal(|ui| {
-                ui.add(Spinner::new().size(13.0).color(NAVY));
-                ui.add(
-                    Label::new(
-                        RichText::new("Verifying SHA-256 checksum\u{2026}")
-                            .font(font_regular(12.0))
-                            .color(UPDATE_TEXT),
-                    )
-                    .selectable(false),
-                );
-            });
+            spinner_row(ui, "Verifying SHA-256 checksum\u{2026}", UPDATE_TEXT);
         }
         UpdatePhase::ReadyToRestart => {
-            ui.add(
-                Label::new(
-                    RichText::new("Update installed \u{2014} restarting\u{2026}")
-                        .font(font_semibold(12.0))
-                        .color(GREEN),
-                )
-                .selectable(false),
-            );
+            ui.add(label(
+                "Update installed \u{2014} restarting\u{2026}",
+                font_semibold(12.0),
+                GREEN,
+            ));
         }
-        UpdatePhase::Error(message) => {
-            ui.add(
-                Label::new(
-                    RichText::new(message)
-                        .font(font_regular(12.0))
-                        .color(DANGER_TEXT),
-                )
-                .wrap()
-                .selectable(false),
-            );
+        UpdatePhase::Error(message) | UpdatePhase::InstallFailed(message) => {
+            ui.add(label(message, font_regular(12.0), DANGER_TEXT).wrap());
         }
     }
 
@@ -632,15 +497,7 @@ fn updates_section(
         let location_text = installer::install_dir()
             .map(|p| format!("Install folder: {}", p.display()))
             .unwrap_or_else(|| "Install folder: %LOCALAPPDATA%\\QR Hub".to_string());
-        ui.add(
-            Label::new(
-                RichText::new(location_text)
-                    .font(font_regular(11.0))
-                    .color(MUTED),
-            )
-            .truncate()
-            .selectable(false),
-        );
+        ui.add(label(location_text, font_regular(11.0), MUTED).truncate());
     }
 
     ui.horizontal(|ui| {
@@ -657,15 +514,7 @@ fn updates_section(
         )
         .clicked()
         {
-            match installer::create_desktop_shortcut() {
-                Ok(_) => {
-                    app.shortcut_feedback =
-                        Some((false, "Desktop shortcut created.".to_string()));
-                }
-                Err(err) => {
-                    app.shortcut_feedback = Some((true, err));
-                }
-            }
+            let _ = app.add_desktop_shortcut();
         }
 
         let start_w = text_button_width(ui, "Repair Start Menu", btn_font.clone(), 10.0);
@@ -678,25 +527,16 @@ fn updates_section(
         )
         .clicked()
         {
-            match installer::ensure_start_menu_shortcut() {
-                Ok(_) => {
-                    app.shortcut_feedback =
-                        Some((false, "Start Menu shortcut updated.".to_string()));
-                }
-                Err(err) => {
-                    app.shortcut_feedback = Some((true, err));
-                }
-            }
+            let _ = app.record_shortcut_result(
+                installer::ensure_start_menu_shortcut(),
+                "Start Menu shortcut updated.",
+            );
         }
     });
 
     if let Some((is_err, msg)) = &app.shortcut_feedback {
         let color = if *is_err { DANGER_TEXT } else { GREEN };
-        ui.add(
-            Label::new(RichText::new(msg).font(font_semibold(12.0)).color(color))
-                .wrap()
-                .selectable(false),
-        );
+        ui.add(label(msg, font_semibold(12.0), color).wrap());
     }
 }
 

@@ -1,7 +1,5 @@
 //! Direct Win32 GDI 4" x 6" thermal label printing pipeline (`#[cfg(windows)]`).
 
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use windows::core::{PCWSTR, PWSTR};
@@ -11,9 +9,9 @@ use windows::Win32::Graphics::Gdi::{
     GetDeviceCaps, GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor,
     CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, DEVMODEW, DMORIENT_PORTRAIT,
     DMPAPER_USER, DM_FORMNAME, DM_IN_BUFFER, DM_ORIENTATION, DM_OUT_BUFFER, DM_PAPERLENGTH,
-    DM_PAPERSIZE, DM_PAPERWIDTH, DT_CENTER, DT_NOCLIP, DT_SINGLELINE, DT_TOP, FF_SWISS, FW_BOLD,
-    HBRUSH, HDC, HGDIOBJ, LOGPIXELSX, LOGPIXELSY, OUT_TT_PRECIS, PHYSICALHEIGHT, PHYSICALOFFSETX,
-    PHYSICALOFFSETY, PHYSICALWIDTH, TRANSPARENT, VARIABLE_PITCH,
+    DM_PAPERSIZE, DM_PAPERWIDTH, DT_CENTER, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_TOP,
+    FF_SWISS, FW_BOLD, HBRUSH, HDC, HGDIOBJ, LOGPIXELSX, LOGPIXELSY, OUT_TT_PRECIS, PHYSICALHEIGHT,
+    PHYSICALOFFSETX, PHYSICALOFFSETY, PHYSICALWIDTH, TRANSPARENT, VARIABLE_PITCH,
 };
 use windows::Win32::Graphics::Printing::{
     ClosePrinter, DocumentPropertiesW, EnumPrintersW, OpenPrinterW, PRINTER_ENUM_CONNECTIONS,
@@ -23,15 +21,9 @@ use windows::Win32::Storage::Xps::{AbortDoc, EndDoc, EndPage, StartDocW, StartPa
 
 use crate::config::AppConfig;
 use crate::domain::PrintJob;
-use crate::printer::{compute_label_layout, DeviceMetrics};
+use crate::printer::{compute_label_layout, DeviceMetrics, LabelLayout};
 use crate::qr;
-
-fn to_wide_null(s: &str) -> Vec<u16> {
-    OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
+use crate::wide::to_wide_null;
 
 /// Safely reads a null-terminated UTF-16 pointer into a Rust `String`.
 unsafe fn pwstr_to_string(ptr: PWSTR) -> Option<String> {
@@ -44,6 +36,36 @@ unsafe fn pwstr_to_string(ptr: PWSTR) -> Option<String> {
     }
     let slice = std::slice::from_raw_parts(ptr.0, len);
     Some(String::from_utf16_lossy(slice))
+}
+
+/// Zeroed, 8-byte-aligned byte buffer for Win32 APIs that fill variable-size structs
+/// (`PRINTER_INFO_4W[]`, `DEVMODEW` + driver data). A plain `Vec<u8>` is only 1-byte
+/// aligned, so casting it to those struct types would be undefined behavior.
+struct AlignedBuf {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl AlignedBuf {
+    fn new(len: usize) -> Self {
+        Self {
+            words: vec![0u64; len.div_ceil(std::mem::size_of::<u64>())],
+            len,
+        }
+    }
+
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr().cast::<u8>(), self.len) }
+    }
+
+    fn as_mut_ptr<T>(&mut self) -> *mut T {
+        const { assert!(std::mem::align_of::<T>() <= std::mem::align_of::<u64>()) };
+        self.words.as_mut_ptr().cast::<T>()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
 }
 
 struct PrinterHandleGuard(HANDLE);
@@ -89,7 +111,7 @@ struct SelectedObjectGuard {
 
 impl Drop for SelectedObjectGuard {
     fn drop(&mut self) {
-        if !self.prev.0.is_null() {
+        if is_valid_gdi_obj(self.prev) {
             unsafe {
                 let _ = SelectObject(self.hdc, self.prev);
             }
@@ -138,13 +160,13 @@ pub fn enumerate_printers() -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
 
-    let mut buf = vec![0u8; needed as usize];
+    let mut buf = AlignedBuf::new(needed as usize);
     let ok = unsafe {
         EnumPrintersW(
             flags,
             PCWSTR::null(),
             4,
-            Some(&mut buf),
+            Some(buf.as_bytes_mut()),
             &mut needed,
             &mut returned,
         )
@@ -153,8 +175,14 @@ pub fn enumerate_printers() -> Result<Vec<String>, String> {
         return Err("Failed to enumerate installed Windows printers.".to_string());
     }
 
+    let fits =
+        (returned as usize).saturating_mul(std::mem::size_of::<PRINTER_INFO_4W>()) <= buf.len();
+    if !fits {
+        return Err("Printer list returned by Windows was larger than its buffer.".to_string());
+    }
+
     let mut names = Vec::with_capacity(returned as usize);
-    let infos = buf.as_ptr() as *const PRINTER_INFO_4W;
+    let infos = buf.as_mut_ptr::<PRINTER_INFO_4W>() as *const PRINTER_INFO_4W;
     for i in 0..(returned as usize) {
         let info = unsafe { &*infos.add(i) };
         if let Some(name) = unsafe { pwstr_to_string(info.pPrinterName) } {
@@ -197,7 +225,7 @@ pub fn print_label_gdi(job: &PrintJob, config: &AppConfig) -> Result<(), String>
     let mut devmode_buf = prepare_devmode(printer_handle, &printer_wide, config)?;
     let devmode_ptr = devmode_buf
         .as_mut()
-        .map(|b| b.as_mut_ptr() as *const DEVMODEW);
+        .map(|b| b.as_mut_ptr::<DEVMODEW>() as *const DEVMODEW);
 
     let driver_wide = to_wide_null("WINSPOOL");
     let hdc = unsafe {
@@ -252,120 +280,173 @@ pub fn print_label_gdi(job: &PrintJob, config: &AppConfig) -> Result<(), String>
         ));
     }
 
-    // Create bold uppercase sans-serif header font if needed and measure its exact pixel height,
-    // scaling down gracefully if a long payload header (e.g. 1Z tracking / UNPK) exceeds 90% width.
-    let font_face = to_wide_null("Segoe UI");
-    let dpi_y = metrics.dpi_y.max(72);
-    let create_header_font = |height_px: i32| -> Result<windows::Win32::Graphics::Gdi::HFONT, String> {
-        let font = unsafe {
-            CreateFontW(
-                height_px,
-                0,
-                0,
-                0,
-                FW_BOLD.0 as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET.0 as u32,
-                OUT_TT_PRECIS.0 as u32,
-                CLIP_DEFAULT_PRECIS.0 as u32,
-                DEFAULT_QUALITY.0 as u32,
-                (VARIABLE_PITCH.0 | FF_SWISS.0) as u32,
-                PCWSTR(font_face.as_ptr()),
-            )
-        };
-        if font.0.is_null() {
-            Err("Failed to create Win32 header font.".to_string())
-        } else {
-            Ok(font)
-        }
-    };
-
-    let mut font_height = -mul_div_i32(26, dpi_y, 72);
-    let header_font = create_header_font(font_height)?;
-    let _font_guard = GdiObjectGuard(HGDIOBJ(header_font.0));
-    let mut _scaled_font_guard: Option<GdiObjectGuard> = None;
-
-    let prev_font = unsafe { SelectObject(hdc, HGDIOBJ(header_font.0)) };
-    let _selected_font_guard = SelectedObjectGuard {
-        hdc,
-        prev: prev_font,
-    };
-
-    let mut header_wide = header_upper
+    let max_header_w = ((metrics.physical_width.max(1) as f32) * 0.90).round() as i32;
+    let mut header_wide: Vec<u16> = header_upper
         .as_deref()
-        .map(to_wide_null)
+        .map(|h| h.encode_utf16().collect())
         .unwrap_or_default();
-
-    let header_height_px = if header_upper.is_some() {
-        let mut sz = SIZE::default();
-        let char_count = header_wide.len().saturating_sub(1);
-        let ok = unsafe {
-            GetTextExtentPoint32W(hdc, &header_wide[..char_count], &mut sz).as_bool()
-        };
-        let max_header_w = ((metrics.physical_width.max(1) as f32) * 0.90).round() as i32;
-        if ok && sz.cx > max_header_w && max_header_w > 0 {
-            let scaled_pt = ((26.0 * max_header_w as f32) / sz.cx as f32)
-                .floor()
-                .clamp(10.0, 26.0) as i32;
-            if scaled_pt < 26 {
-                font_height = -mul_div_i32(scaled_pt, dpi_y, 72);
-                let scaled_font = create_header_font(font_height)?;
-                _scaled_font_guard = Some(GdiObjectGuard(HGDIOBJ(scaled_font.0)));
-                unsafe {
-                    let _ = SelectObject(hdc, HGDIOBJ(scaled_font.0));
-                    let _ = GetTextExtentPoint32W(hdc, &header_wide[..char_count], &mut sz);
-                }
-            }
-        }
-        if sz.cy > 0 {
-            sz.cy
-        } else {
-            font_height.abs()
-        }
-    } else {
-        0
+    let header_font = match header_upper {
+        Some(_) => Some(fit_header_font(
+            hdc,
+            &header_wide,
+            max_header_w,
+            metrics.dpi_y.max(72),
+        )?),
+        None => None,
     };
 
     let layout = compute_label_layout(
         metrics,
         matrix.width,
-        header_upper.is_some(),
-        header_height_px,
+        header_font.is_some(),
+        header_font.as_ref().map_or(0, |f| f.text_height),
         config,
     );
 
-    // Draw centered uppercase header above the QR code.
-    if header_upper.is_some() && !header_wide.is_empty() {
-        unsafe {
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, COLORREF(0x0000_0000)); // pure black RGB(0,0,0)
-        }
-        let half_w = (metrics.physical_width.max(layout.qr_actual_px) / 2).max(layout.qr_actual_px);
-        let mut header_rect = RECT {
-            left: layout.header_center_x_px - half_w,
-            top: layout.header_y_px,
-            right: layout.header_center_x_px + half_w,
-            bottom: layout.header_y_px + layout.header_height_px.max(font_height.abs()) + 8,
-        };
-        let char_len = header_wide.len().saturating_sub(1);
-        unsafe {
-            let _ = DrawTextW(
-                hdc,
-                &mut header_wide[..char_len],
-                &mut header_rect,
-                DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOCLIP,
-            );
+    if let Some(font) = &header_font {
+        draw_header(hdc, &mut header_wide, &layout, metrics, font.font_height);
+    }
+    draw_qr_modules(hdc, &matrix, &layout)?;
+
+    if unsafe { EndPage(hdc) } <= 0 {
+        return Err(format!(
+            "Failed to finish page on printer \"{printer_name}\"."
+        ));
+    }
+
+    doc_guard.finish()
+}
+
+/// Point size of the label header before any shrink-to-fit.
+const HEADER_FONT_PT: i32 = 26;
+/// Smallest point size a long header may shrink to.
+const MIN_HEADER_FONT_PT: i32 = 10;
+
+/// `SelectObject` signals failure with either NULL or `HGDI_ERROR` (-1).
+fn is_valid_gdi_obj(obj: HGDIOBJ) -> bool {
+    !obj.0.is_null() && obj.0 as isize != -1
+}
+
+/// Header font selected into the DC. Field order matters: the selection is restored
+/// before the font is deleted.
+struct HeaderFont {
+    _selection: SelectedObjectGuard,
+    _font: GdiObjectGuard,
+    /// Measured text height in device pixels.
+    text_height: i32,
+    /// Font height passed to `CreateFontW` (negative = character height).
+    font_height: i32,
+}
+
+fn create_bold_font(face: &[u16], height_px: i32) -> Result<GdiObjectGuard, String> {
+    let font = unsafe {
+        CreateFontW(
+            height_px,
+            0,
+            0,
+            0,
+            FW_BOLD.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            DEFAULT_QUALITY.0 as u32,
+            (VARIABLE_PITCH.0 | FF_SWISS.0) as u32,
+            PCWSTR(face.as_ptr()),
+        )
+    };
+    if font.0.is_null() {
+        Err("Failed to create Win32 header font.".to_string())
+    } else {
+        Ok(GdiObjectGuard(HGDIOBJ(font.0)))
+    }
+}
+
+/// Selects a bold Segoe UI header font, shrinking it (down to 10 pt) when `text` is wider
+/// than `max_width` (e.g. long 1Z tracking or UNPK headers).
+fn fit_header_font(
+    hdc: HDC,
+    text: &[u16],
+    max_width: i32,
+    dpi_y: i32,
+) -> Result<HeaderFont, String> {
+    let face = to_wide_null("Segoe UI");
+    let mut font_height = -mul_div_i32(HEADER_FONT_PT, dpi_y, 72);
+    let mut font = create_bold_font(&face, font_height)?;
+    let prev = unsafe { SelectObject(hdc, font.0) };
+    let selection = SelectedObjectGuard { hdc, prev };
+
+    let mut size = SIZE::default();
+    let measured = unsafe { GetTextExtentPoint32W(hdc, text, &mut size).as_bool() };
+    if measured && max_width > 0 && size.cx > max_width {
+        let scaled_pt = ((HEADER_FONT_PT as f32 * max_width as f32) / size.cx as f32)
+            .floor()
+            .clamp(MIN_HEADER_FONT_PT as f32, HEADER_FONT_PT as f32) as i32;
+        if scaled_pt < HEADER_FONT_PT {
+            let scaled_height = -mul_div_i32(scaled_pt, dpi_y, 72);
+            let scaled = create_bold_font(&face, scaled_height)?;
+            // Only swap fonts if the selection worked: deleting a still-selected font leaks it.
+            if is_valid_gdi_obj(unsafe { SelectObject(hdc, scaled.0) }) {
+                unsafe {
+                    let _ = GetTextExtentPoint32W(hdc, text, &mut size);
+                }
+                font_height = scaled_height;
+                font = scaled;
+            }
         }
     }
 
-    // Draw every dark QR module with pure black FillRect at exact integer device coordinates.
-    let black_brush: HBRUSH = unsafe { CreateSolidBrush(COLORREF(0x0000_0000)) };
-    if black_brush.0.is_null() {
+    Ok(HeaderFont {
+        _selection: selection,
+        _font: font,
+        text_height: if size.cy > 0 {
+            size.cy
+        } else {
+            font_height.abs()
+        },
+        font_height,
+    })
+}
+
+/// Draws the centered uppercase header above the QR code in pure black.
+fn draw_header(
+    hdc: HDC,
+    text: &mut [u16],
+    layout: &LabelLayout,
+    metrics: DeviceMetrics,
+    font_height: i32,
+) {
+    unsafe {
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, COLORREF(0x0000_0000));
+    }
+    let half_w = (metrics.physical_width.max(layout.qr_actual_px) / 2).max(layout.qr_actual_px);
+    let mut rect = RECT {
+        left: layout.header_center_x_px - half_w,
+        top: layout.header_y_px,
+        right: layout.header_center_x_px + half_w,
+        bottom: layout.header_y_px + layout.header_height_px.max(font_height.abs()) + 8,
+    };
+    unsafe {
+        let _ = DrawTextW(
+            hdc,
+            text,
+            &mut rect,
+            // NOPREFIX: print '&' literally instead of as an accelerator underline.
+            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOCLIP | DT_NOPREFIX,
+        );
+    }
+}
+
+/// Fills every dark QR module as a pure black rect at exact integer device coordinates.
+fn draw_qr_modules(hdc: HDC, matrix: &qr::QrMatrix, layout: &LabelLayout) -> Result<(), String> {
+    let brush: HBRUSH = unsafe { CreateSolidBrush(COLORREF(0x0000_0000)) };
+    if brush.0.is_null() {
         return Err("Failed to create Win32 black brush.".to_string());
     }
-    let _brush_guard = GdiObjectGuard(HGDIOBJ(black_brush.0));
+    let _brush_guard = GdiObjectGuard(HGDIOBJ(brush.0));
 
     let m = layout.module_px;
     for (row, col) in matrix.dark_modules() {
@@ -377,19 +458,11 @@ pub fn print_label_gdi(job: &PrintJob, config: &AppConfig) -> Result<(), String>
             right: left + m,
             bottom: top + m,
         };
-        let rc = unsafe { FillRect(hdc, &rect, black_brush) };
-        if rc == 0 {
+        if unsafe { FillRect(hdc, &rect, brush) } == 0 {
             return Err("Win32 FillRect failed while drawing QR module.".to_string());
         }
     }
-
-    if unsafe { EndPage(hdc) } <= 0 {
-        return Err(format!(
-            "Failed to finish page on printer \"{printer_name}\"."
-        ));
-    }
-
-    doc_guard.finish()
+    Ok(())
 }
 
 /// Allocates, populates, and validates a `DEVMODEW` buffer for the target printer.
@@ -397,7 +470,7 @@ fn prepare_devmode(
     printer_handle: HANDLE,
     printer_wide: &[u16],
     config: &AppConfig,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<AlignedBuf>, String> {
     let needed = unsafe {
         DocumentPropertiesW(
             HWND(ptr::null_mut()),
@@ -408,12 +481,13 @@ fn prepare_devmode(
             0,
         )
     };
-    if needed <= 0 {
+    // A buffer smaller than DEVMODEW would make the field writes below out of bounds.
+    if needed <= 0 || (needed as usize) < std::mem::size_of::<DEVMODEW>() {
         return Ok(None);
     }
 
-    let mut buf = vec![0u8; needed as usize];
-    let dm_ptr = buf.as_mut_ptr() as *mut DEVMODEW;
+    let mut buf = AlignedBuf::new(needed as usize);
+    let dm_ptr = buf.as_mut_ptr::<DEVMODEW>();
 
     let rc = unsafe {
         DocumentPropertiesW(
@@ -433,8 +507,10 @@ fn prepare_devmode(
         unsafe {
             let dm = &mut *dm_ptr;
             // 1 inch = 25.4 mm = 254 tenths of a millimeter (4.0" -> 1016, 6.0" -> 1524).
-            let width_tenths_mm = (config.label_width_inches.clamp(1.0, 12.0) * 254.0).round() as i16;
-            let height_tenths_mm = (config.label_height_inches.clamp(1.0, 18.0) * 254.0).round() as i16;
+            let width_tenths_mm =
+                (config.label_width_inches.clamp(1.0, 12.0) * 254.0).round() as i16;
+            let height_tenths_mm =
+                (config.label_height_inches.clamp(1.0, 18.0) * 254.0).round() as i16;
 
             dm.dmFields &= !DM_FORMNAME;
             dm.dmFields |= DM_ORIENTATION | DM_PAPERSIZE | DM_PAPERWIDTH | DM_PAPERLENGTH;

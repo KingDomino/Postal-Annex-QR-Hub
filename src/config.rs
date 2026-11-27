@@ -2,6 +2,7 @@
 //! (with automatic read fallback to legacy `%APPDATA%\PostalAnnexQRScanner\config.json`).
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
@@ -28,8 +29,17 @@ pub struct AppConfig {
     pub offset_y_mm: f32,
     pub auto_check_updates: bool,
     pub github_repo: String,
-    #[serde(default)]
     pub last_seen_version: Option<String>,
+}
+
+/// Result of loading the config from disk.
+#[derive(Debug, Default)]
+pub struct LoadedConfig {
+    pub config: AppConfig,
+    /// A config file (current or legacy) was present on disk.
+    pub existed: bool,
+    /// Set when an existing file could not be read and defaults were used instead.
+    pub warning: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -73,29 +83,44 @@ fn legacy_config_path() -> Option<PathBuf> {
 }
 
 impl AppConfig {
-    /// Loads the config from the default [`config_path`], falling back to the legacy
-    /// `PostalAnnexQRScanner/config.json` location if present, or [`Self::default`]
-    /// if neither exists or can be parsed.
-    pub fn load() -> Self {
-        Self::load_with_existing_flag().0
-    }
-
     /// Loads configuration from [`config_path`] (or legacy `PostalAnnexQRScanner/config.json`
     /// if the new path does not exist yet), returning `(config, existed_on_disk)`.
-    pub fn load_with_existing_flag() -> (Self, bool) {
+    pub fn load_with_existing_flag() -> LoadedConfig {
         Self::load_with_fallback(config_path().as_deref(), legacy_config_path().as_deref())
     }
 
     /// Loads from `primary` if it exists on disk, otherwise from `legacy` if it exists.
-    /// Returns `(cfg, true)` if either file was present on disk, or `(Self::default(), false)`.
-    pub fn load_with_fallback(primary: Option<&Path>, legacy: Option<&Path>) -> (Self, bool) {
-        if let Some(path) = primary.filter(|p| p.exists()) {
-            return (Self::load_from(path).unwrap_or_default(), true);
+    /// `existed` is true if either file was present on disk.
+    ///
+    /// An unreadable file falls back to defaults, but is first renamed to `*.bad` so the
+    /// next save cannot destroy it, and a `warning` is returned for the UI to show.
+    pub fn load_with_fallback(primary: Option<&Path>, legacy: Option<&Path>) -> LoadedConfig {
+        let Some(path) = primary
+            .filter(|p| p.exists())
+            .or_else(|| legacy.filter(|p| p.exists()))
+        else {
+            return LoadedConfig::default();
+        };
+        match Self::load_from(path) {
+            Ok(config) => LoadedConfig {
+                config,
+                existed: true,
+                warning: None,
+            },
+            Err(err) => {
+                let mut backup = path.as_os_str().to_os_string();
+                backup.push(".bad");
+                let _ = fs::rename(path, &backup);
+                LoadedConfig {
+                    config: Self::default(),
+                    existed: true,
+                    warning: Some(format!(
+                        "Settings were reset because they could not be read ({err}). The old file was kept as {}.",
+                        Path::new(&backup).display()
+                    )),
+                }
+            }
         }
-        if let Some(path) = legacy.filter(|p| p.exists()) {
-            return (Self::load_from(path).unwrap_or_default(), true);
-        }
-        (Self::default(), false)
     }
 
     /// Loads configuration from a specific JSON file path.
@@ -126,8 +151,23 @@ impl AppConfig {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
-        fs::write(path, json)
-            .map_err(|e| format!("Failed to write config {}: {e}", path.display()))
+        // Write a sibling temp file and rename over the target, so a crash mid-write can
+        // never leave a truncated config.json (which would silently reset calibration).
+        // sync_all makes the data durable before the rename, so a power cut cannot leave an
+        // empty file; the PID keeps two running instances from sharing one temp file.
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(format!(".{}.tmp", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        fs::File::create(&tmp)
+            .and_then(|mut file| {
+                file.write_all(json.as_bytes())?;
+                file.sync_all()
+            })
+            .and_then(|()| fs::rename(&tmp, path))
+            .map_err(|e| {
+                let _ = fs::remove_file(&tmp);
+                format!("Failed to write config {}: {e}", path.display())
+            })
     }
 
     /// Returns the trimmed active printer name, or `None` if unconfigured or blank.
@@ -211,7 +251,11 @@ mod tests {
         let legacy = dir.join("PostalAnnexQRScanner").join("config.json");
 
         // Neither exists -> default, existed = false
-        let (cfg, existed) = AppConfig::load_with_fallback(Some(&primary), Some(&legacy));
+        let LoadedConfig {
+            config: cfg,
+            existed,
+            ..
+        } = AppConfig::load_with_fallback(Some(&primary), Some(&legacy));
         assert!(!existed);
         assert_eq!(cfg, AppConfig::default());
 
@@ -222,7 +266,11 @@ mod tests {
             ..Default::default()
         };
         legacy_cfg.save_to(&legacy).expect("save legacy");
-        let (cfg, existed) = AppConfig::load_with_fallback(Some(&primary), Some(&legacy));
+        let LoadedConfig {
+            config: cfg,
+            existed,
+            ..
+        } = AppConfig::load_with_fallback(Some(&primary), Some(&legacy));
         assert!(existed);
         assert_eq!(cfg, legacy_cfg);
 
@@ -233,7 +281,11 @@ mod tests {
             ..Default::default()
         };
         primary_cfg.save_to(&primary).expect("save primary");
-        let (cfg, existed) = AppConfig::load_with_fallback(Some(&primary), Some(&legacy));
+        let LoadedConfig {
+            config: cfg,
+            existed,
+            ..
+        } = AppConfig::load_with_fallback(Some(&primary), Some(&legacy));
         assert!(existed);
         assert_eq!(cfg, primary_cfg);
 
@@ -255,5 +307,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.active_printer(), None);
+    }
+
+    #[test]
+    fn corrupt_config_is_kept_as_bad_and_reported() {
+        let dir =
+            std::env::temp_dir().join(format!("qr_hub_cfg_corrupt_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let primary = dir.join("config.json");
+        fs::write(&primary, "{ not json").unwrap();
+
+        let loaded = AppConfig::load_with_fallback(Some(&primary), None);
+        assert!(loaded.existed);
+        assert_eq!(loaded.config, AppConfig::default());
+        assert!(loaded.warning.is_some());
+        assert!(!primary.exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("config.json.bad")).unwrap(),
+            "{ not json"
+        );
+
+        // Saving afterwards leaves no stray temp files behind.
+        loaded.config.save_to(&primary).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

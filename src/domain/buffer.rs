@@ -37,11 +37,6 @@ impl ScanBuffer {
         }
     }
 
-    /// Returns the configured inactivity timeout.
-    pub fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
     /// Checks whether the buffer has expired as of `now`.
     ///
     /// If non-empty and `now - last_input_at >= timeout`, clears the buffer and
@@ -104,11 +99,6 @@ impl ScanBuffer {
     /// Returns `true` if no characters are currently buffered.
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
-    }
-
-    /// Returns the byte length of the buffered string.
-    pub fn len(&self) -> usize {
-        self.buffer.len()
     }
 
     /// Returns the current buffered string slice.

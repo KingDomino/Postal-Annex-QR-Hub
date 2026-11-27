@@ -74,7 +74,9 @@ pub fn compute_label_layout(
         (config.label_height_inches.max(1.0) * dpi_y as f32).round() as i32
     };
 
-    let target_qr_px = (config.qr_size_inches.clamp(0.5, config.label_width_inches.max(1.0))
+    let target_qr_px = (config
+        .qr_size_inches
+        .clamp(0.5, config.label_width_inches.max(1.0))
         * dpi_x as f32)
         .round() as i32;
 
@@ -136,7 +138,8 @@ pub enum PrintCommand {
 /// Events emitted by the background [`PrintWorker`] thread for the UI to consume.
 #[derive(Debug, Clone)]
 pub enum PrintEvent {
-    PrintSucceeded { header: Option<String> },
+    PrintSucceeded,
+    /// Error message, prefixed with the label header (if any) so it is clear which label failed.
     PrintFailed(String),
     PrintersLoaded(Result<Vec<String>, String>),
 }
@@ -162,8 +165,11 @@ impl PrintWorker {
                 while let Ok(cmd) = cmd_rx.recv() {
                     let event = match cmd {
                         PrintCommand::Print { job, config } => match print_label(&job, &config) {
-                            Ok(()) => PrintEvent::PrintSucceeded { header: job.header },
-                            Err(err) => PrintEvent::PrintFailed(err),
+                            Ok(()) => PrintEvent::PrintSucceeded,
+                            Err(err) => PrintEvent::PrintFailed(match job.header {
+                                Some(header) => format!("{header}: {err}"),
+                                None => err,
+                            }),
                         },
                         PrintCommand::RefreshPrinters => {
                             PrintEvent::PrintersLoaded(list_printers())
@@ -192,14 +198,21 @@ impl PrintWorker {
     }
 
     /// Queues a print job respecting [`PrintTrigger`] and `config.auto_print_on_scan`.
+    /// Returns `true` if the job was queued (and a [`PrintEvent`] will follow).
     ///
     /// - [`PrintTrigger::Auto`]: prints only if `config.auto_print_on_scan` is `true`.
     /// - [`PrintTrigger::Manual`]: always prints (Override, Reprint, Test Print).
-    pub fn print_with_trigger(&self, job: PrintJob, trigger: PrintTrigger, config: AppConfig) {
+    pub fn print_with_trigger(
+        &self,
+        job: PrintJob,
+        trigger: PrintTrigger,
+        config: AppConfig,
+    ) -> bool {
         if trigger == PrintTrigger::Auto && !config.auto_print_on_scan {
-            return;
+            return false;
         }
         self.print(job, config);
+        true
     }
 
     /// Requests asynchronous enumeration of installed printers.
@@ -296,13 +309,16 @@ mod tests {
             layout.header_center_x_px - (layout.qr_actual_px / 2)
         );
         // QR lies below header + gap
-        assert_eq!(layout.qr_origin_y_px, layout.header_y_px + 73 + layout.gap_px);
+        assert_eq!(
+            layout.qr_origin_y_px,
+            layout.header_y_px + 73 + layout.gap_px
+        );
     }
 
     #[test]
     fn layout_headerless_override_centers_qr_only_and_applies_mm_offsets() {
         let cfg = AppConfig {
-            offset_x_mm: 2.54, // +0.1 in -> +30 px at 300 DPI
+            offset_x_mm: 2.54,  // +0.1 in -> +30 px at 300 DPI
             offset_y_mm: -2.54, // -0.1 in -> -30 px at 300 DPI
             ..Default::default()
         };
@@ -320,10 +336,7 @@ mod tests {
         assert_eq!(layout.gap_px, 0);
         assert_eq!(layout.total_block_height_px, layout.qr_actual_px);
         assert_eq!(layout.header_center_x_px, 600 + 30);
-        assert_eq!(
-            layout.qr_origin_y_px,
-            (1800 - layout.qr_actual_px) / 2 - 30
-        );
+        assert_eq!(layout.qr_origin_y_px, (1800 - layout.qr_actual_px) / 2 - 30);
     }
 
     #[test]
@@ -366,10 +379,10 @@ mod tests {
             ..Default::default()
         };
         let job = crate::domain::ScannerStateMachine::test_print_job();
-        worker.print_with_trigger(job.clone(), PrintTrigger::Auto, disabled_cfg.clone());
+        assert!(!worker.print_with_trigger(job.clone(), PrintTrigger::Auto, disabled_cfg.clone()));
 
         // Manual print STILL runs even when auto_print_on_scan is false
-        worker.print_with_trigger(job.clone(), PrintTrigger::Manual, disabled_cfg);
+        assert!(worker.print_with_trigger(job.clone(), PrintTrigger::Manual, disabled_cfg));
 
         // Missing printer produces a clear PrintFailed event
         worker.print(job, AppConfig::default());
@@ -388,13 +401,11 @@ mod tests {
         }
 
         assert_eq!(events.len(), 3);
-        assert!(matches!(
-            &events[0],
-            PrintEvent::PrintSucceeded {
-                header: Some(h)
-            } if h == "Test Label"
-        ));
-        assert!(matches!(&events[1], PrintEvent::PrintFailed(_)));
+        assert!(matches!(&events[0], PrintEvent::PrintSucceeded));
+        // Failures name the label that failed.
+        assert!(
+            matches!(&events[1], PrintEvent::PrintFailed(msg) if msg.starts_with("Test Label: "))
+        );
         assert!(matches!(
             &events[2],
             PrintEvent::PrintersLoaded(Ok(list)) if list.len() == 1

@@ -12,3 +12,5 @@ pub mod installer;
 pub mod printer;
 pub mod qr;
 pub mod updater;
+#[cfg(windows)]
+mod wide;

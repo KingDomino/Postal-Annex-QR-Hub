@@ -49,19 +49,11 @@ fn compile_cross_windows_resource() {
     let icon_path = manifest_dir.join("assets").join("icon.ico");
     let escaped_icon = escape_rc_path(&icon_path);
 
-    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
-    let major: u16 = std::env::var("CARGO_PKG_VERSION_MAJOR")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let minor: u16 = std::env::var("CARGO_PKG_VERSION_MINOR")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let patch: u16 = std::env::var("CARGO_PKG_VERSION_PATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // Cargo always sets these for build scripts.
+    let version = env!("CARGO_PKG_VERSION");
+    let major = env!("CARGO_PKG_VERSION_MAJOR");
+    let minor = env!("CARGO_PKG_VERSION_MINOR");
+    let patch = env!("CARGO_PKG_VERSION_PATCH");
 
     let rc_contents = format!(
         r#"1 ICON "{escaped_icon}"
@@ -108,10 +100,7 @@ END
         .arg("app.rc")
         .status()
         .expect("failed to execute llvm-rc");
-    assert!(
-        status.success(),
-        "llvm-rc failed with status: {status}"
-    );
+    assert!(status.success(), "llvm-rc failed with status: {status}");
 
     // Link only into binary targets, not unit test harnesses or proc-macros.
     println!("cargo:rustc-link-arg-bins={}", res_path.display());
@@ -121,13 +110,8 @@ END
     }
 
     fn find_on_path(bin: &str) -> Option<PathBuf> {
-        let path_var = std::env::var_os("PATH")?;
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(bin);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        None
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(bin))
+            .find(|candidate| candidate.is_file())
     }
 }

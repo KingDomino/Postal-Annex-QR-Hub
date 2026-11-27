@@ -19,10 +19,7 @@ pub enum ScanRoute {
         rma: Option<String>,
     },
     /// Priority 4: normalized payload starts with `"UNPK-"`.
-    Unpacked {
-        payload: String,
-        content: String,
-    },
+    Unpacked { payload: String, content: String },
     /// Priority 5: normalized payload starts with `"1Z"`.
     UpsTracking { payload: String },
     /// Fallback: unrecognized return payload.
@@ -52,12 +49,16 @@ pub fn flip_case(input: &str) -> String {
 /// inverted on the scanner/workstation, so every character's case is individually inverted
 /// via [`flip_case`].
 pub fn normalize_caps_lock(text: &str) -> String {
-    let is_inverted_afnlf =
-        text.starts_with('a') && text.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("afnlf"));
+    let is_inverted_afnlf = text.starts_with('a')
+        && text
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("afnlf"));
     let is_inverted_hr =
         text.starts_with('h') && text.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("hr"));
-    let is_inverted_unpk =
-        text.starts_with('u') && text.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("unpk-"));
+    let is_inverted_unpk = text.starts_with('u')
+        && text
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("unpk-"));
     let is_inverted_1z = text.starts_with("1z");
 
     if is_inverted_afnlf || is_inverted_hr || is_inverted_unpk || is_inverted_1z {

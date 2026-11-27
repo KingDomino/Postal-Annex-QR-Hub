@@ -27,6 +27,8 @@ pub enum AlertBadge {
     Green { text: String },
     /// Yellow warning pill (`#ffc107` bg, `#212529` text).
     Yellow { text: String },
+    /// Red error pill, shown by the UI when a copy the badge promised did not happen.
+    Danger { text: String },
 }
 
 /// Interactive confirmation prompt awaiting a Yes/No click from the associate.
@@ -558,7 +560,9 @@ mod tests {
         assert_eq!(effects.len(), 3);
         assert_eq!(
             sm.trigger_copy_all(),
-            vec![AppEffect::CopyToClipboard("AFNLFBF|NEW_RMA|TAIL".to_string())]
+            vec![AppEffect::CopyToClipboard(
+                "AFNLFBF|NEW_RMA|TAIL".to_string()
+            )]
         );
 
         // Whitespace scan does NOT flush LabelReady or last_print_job
@@ -589,7 +593,10 @@ mod tests {
 
         // From UnrecognizedWarning
         sm.handle_scan("RANDOM_DATA");
-        assert!(matches!(sm.screen(), ScreenState::UnrecognizedWarning { .. }));
+        assert!(matches!(
+            sm.screen(),
+            ScreenState::UnrecognizedWarning { .. }
+        ));
         sm.reset();
         assert_eq!(sm.screen(), &ScreenState::Ready);
         assert!(sm.last_print_job().is_none());

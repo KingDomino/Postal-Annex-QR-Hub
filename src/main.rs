@@ -41,6 +41,12 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         WINDOW_TITLE,
         native_options,
-        Box::new(move |cc| Ok(Box::new(ui::ScannerApp::new(cc, just_installed, just_updated)))),
+        Box::new(move |cc| {
+            Ok(Box::new(ui::ScannerApp::new(
+                cc,
+                just_installed,
+                just_updated,
+            )))
+        }),
     )
 }

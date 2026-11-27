@@ -22,8 +22,7 @@ pub const INSTALL_DIR_NAME: &str = "QR Hub";
 /// Canonical installed executable filename.
 pub const INSTALLED_EXE_NAME: &str = "QR Hub.exe";
 /// Per-user Uninstall registry subkey under `HKEY_CURRENT_USER`.
-pub const UNINSTALL_REG_SUBKEY: &str =
-    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\QRHub";
+pub const UNINSTALL_REG_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\QRHub";
 
 /// Legacy v2.0.1 shortcut filename cleaned up on upgrade and uninstall.
 pub const LEGACY_SHORTCUT_FILENAME: &str = "PostalAnnex+ Amazon QR Scanner.lnk";
@@ -169,21 +168,23 @@ pub fn create_desktop_shortcut() -> Result<PathBuf, String> {
 
 #[cfg(windows)]
 mod win32_impl {
-    use std::ffi::{c_void, OsStr};
+    use std::ffi::{c_void, OsString};
     use std::fs;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use windows::core::{Interface, GUID, PCWSTR};
-    use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HWND, RPC_E_CHANGED_MODE, S_FALSE, S_OK};
+    use windows::Win32::Foundation::{
+        ERROR_SUCCESS, HANDLE, HWND, RPC_E_CHANGED_MODE, S_FALSE, S_OK,
+    };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     };
     use windows::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-        KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+        KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
     };
     use windows::Win32::UI::Shell::{
         FOLDERID_Desktop, FOLDERID_Programs, IShellLinkW, SHGetKnownFolderPath, ShellLink,
@@ -191,29 +192,18 @@ mod win32_impl {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         MessageBoxW, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO,
+        MESSAGEBOX_RESULT, MESSAGEBOX_STYLE,
     };
 
     use super::{
-        install_dir, install_exe_path, legacy_install_exe_path, paths_equivalent, CliFlags,
-        StartupAction, APP_DISPLAY_NAME, INSTALLED_EXE_NAME, LEGACY_SHORTCUT_FILENAME,
-        LEGACY_UNINSTALL_REG_SUBKEY, SHORTCUT_FILENAME, UNINSTALL_REG_SUBKEY,
+        install_dir, install_exe_path, is_running_from_install_dir, legacy_install_exe_path,
+        paths_equivalent, CliFlags, StartupAction, APP_DISPLAY_NAME, INSTALLED_EXE_NAME,
+        LEGACY_SHORTCUT_FILENAME, LEGACY_UNINSTALL_REG_SUBKEY, SHORTCUT_FILENAME,
+        UNINSTALL_REG_SUBKEY,
     };
     use crate::config::DEFAULT_GITHUB_REPO;
     use crate::updater::CURRENT_VERSION;
-
-    fn to_wide_null(s: &str) -> Vec<u16> {
-        OsStr::new(s)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    fn path_to_wide_null(path: &Path) -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
+    use crate::wide::to_wide_null;
 
     struct ComGuard {
         should_uninitialize: bool,
@@ -259,10 +249,10 @@ mod win32_impl {
     fn known_folder_path(folder_id: &GUID) -> Result<PathBuf, String> {
         let raw = unsafe { SHGetKnownFolderPath(folder_id, KF_FLAG_CREATE, HANDLE::default()) }
             .map_err(|e| format!("SHGetKnownFolderPath failed: {e}"))?;
-        let path_str = unsafe { raw.to_string() }
-            .map_err(|e| format!("Failed decoding Windows known folder path: {e}"))?;
+        // Copy out losslessly (paths may hold unpaired surrogates), then free the shell buffer.
+        let path = PathBuf::from(OsString::from_wide(unsafe { raw.as_wide() }));
         unsafe { CoTaskMemFree(Some(raw.0 as *const c_void)) };
-        Ok(PathBuf::from(path_str))
+        Ok(path)
     }
 
     fn create_shortcut(
@@ -273,10 +263,7 @@ mod win32_impl {
     ) -> Result<(), String> {
         if let Some(parent) = lnk_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed creating shortcut folder {}: {e}",
-                    parent.display()
-                )
+                format!("Failed creating shortcut folder {}: {e}", parent.display())
             })?;
         }
 
@@ -285,10 +272,10 @@ mod win32_impl {
             unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
                 .map_err(|e| format!("CoCreateInstance(ShellLink) failed: {e}"))?;
 
-        let target_w = path_to_wide_null(target_exe);
-        let work_w = path_to_wide_null(working_dir);
+        let target_w = to_wide_null(target_exe);
+        let work_w = to_wide_null(working_dir);
         let desc_w = to_wide_null(description);
-        let lnk_w = path_to_wide_null(lnk_path);
+        let lnk_w = to_wide_null(lnk_path);
 
         unsafe {
             shell_link
@@ -315,43 +302,37 @@ mod win32_impl {
         Ok(())
     }
 
-    fn set_reg_sz(hkey: HKEY, name: &str, value: &str) -> Result<(), String> {
+    fn set_reg_value(
+        hkey: HKEY,
+        name: &str,
+        kind: REG_VALUE_TYPE,
+        data: &[u8],
+    ) -> Result<(), String> {
         let name_w = to_wide_null(name);
-        let value_bytes: Vec<u8> = to_wide_null(value)
-            .into_iter()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        let err = unsafe {
-            RegSetValueExW(
-                hkey,
-                PCWSTR(name_w.as_ptr()),
-                0,
-                REG_SZ,
-                Some(&value_bytes),
-            )
-        };
+        let err = unsafe { RegSetValueExW(hkey, PCWSTR(name_w.as_ptr()), 0, kind, Some(data)) };
         if err != ERROR_SUCCESS {
             return Err(format!("RegSetValueExW({name}) failed: {err:?}"));
         }
         Ok(())
     }
 
+    fn set_reg_sz(hkey: HKEY, name: &str, value: &str) -> Result<(), String> {
+        let bytes: Vec<u8> = to_wide_null(value)
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        set_reg_value(hkey, name, REG_SZ, &bytes)
+    }
+
     fn set_reg_dword(hkey: HKEY, name: &str, value: u32) -> Result<(), String> {
-        let name_w = to_wide_null(name);
-        let bytes = value.to_le_bytes();
-        let err = unsafe {
-            RegSetValueExW(
-                hkey,
-                PCWSTR(name_w.as_ptr()),
-                0,
-                REG_DWORD,
-                Some(&bytes),
-            )
-        };
-        if err != ERROR_SUCCESS {
-            return Err(format!("RegSetValueExW({name}) failed: {err:?}"));
+        set_reg_value(hkey, name, REG_DWORD, &value.to_le_bytes())
+    }
+
+    fn delete_reg_tree(subkey: &str) {
+        let subkey_w = to_wide_null(subkey);
+        unsafe {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr()));
         }
-        Ok(())
     }
 
     fn register_uninstall_entry(dir: &Path, exe_path: &Path) -> Result<(), String> {
@@ -386,7 +367,11 @@ mod win32_impl {
         set_reg_sz(hkey, "Publisher", "PostalAnnex+")?;
         set_reg_sz(hkey, "DisplayIcon", &format!("{exe_str},0"))?;
         set_reg_sz(hkey, "InstallLocation", &dir_str)?;
-        set_reg_sz(hkey, "UninstallString", &format!("\"{exe_str}\" --uninstall"))?;
+        set_reg_sz(
+            hkey,
+            "UninstallString",
+            &format!("\"{exe_str}\" --uninstall"),
+        )?;
         set_reg_sz(
             hkey,
             "QuietUninstallString",
@@ -414,12 +399,8 @@ mod win32_impl {
 
         let temp_new = dest_dir.join(format!("{INSTALLED_EXE_NAME}.new"));
         let _ = fs::remove_file(&temp_new);
-        fs::copy(src_exe, &temp_new).map_err(|e| {
-            format!(
-                "Failed copying executable to {}: {e}",
-                temp_new.display()
-            )
-        })?;
+        fs::copy(src_exe, &temp_new)
+            .map_err(|e| format!("Failed copying executable to {}: {e}", temp_new.display()))?;
 
         let mut backup_path: Option<PathBuf> = None;
         if dest_exe.exists() {
@@ -427,10 +408,7 @@ mod win32_impl {
             let old_path = if fs::remove_file(&candidate_old).is_ok() || !candidate_old.exists() {
                 candidate_old
             } else {
-                dest_dir.join(format!(
-                    "{INSTALLED_EXE_NAME}.old.{}",
-                    std::process::id()
-                ))
+                dest_dir.join(format!("{INSTALLED_EXE_NAME}.old.{}", std::process::id()))
             };
             if let Err(err) = fs::rename(dest_exe, &old_path) {
                 let _ = fs::remove_file(&temp_new);
@@ -485,7 +463,8 @@ mod win32_impl {
     }
 
     fn resolve_shortcut_target() -> Result<(PathBuf, PathBuf), String> {
-        let dest_dir = install_dir().ok_or_else(|| "Could not locate %LOCALAPPDATA%.".to_string())?;
+        let dest_dir =
+            install_dir().ok_or_else(|| "Could not locate %LOCALAPPDATA%.".to_string())?;
         let dest_exe = dest_dir.join(INSTALLED_EXE_NAME);
         if dest_exe.exists() {
             Ok((dest_exe, dest_dir))
@@ -497,16 +476,43 @@ mod win32_impl {
         }
     }
 
+    /// Removes `filename` from both the Start Menu and the Desktop (best effort).
+    fn remove_shortcuts(filename: &str) {
+        let paths = [
+            start_menu_shortcut_path(filename),
+            desktop_shortcut_path(filename),
+        ];
+        for lnk in paths.into_iter().flatten() {
+            let _ = fs::remove_file(lnk);
+        }
+    }
+
     fn cleanup_legacy_install_artifacts() {
-        if let Ok(lnk) = start_menu_shortcut_path(LEGACY_SHORTCUT_FILENAME) {
-            let _ = fs::remove_file(lnk);
+        remove_shortcuts(LEGACY_SHORTCUT_FILENAME);
+        delete_reg_tree(LEGACY_UNINSTALL_REG_SUBKEY);
+    }
+
+    /// Ensures the Start Menu shortcut and Installed Apps entry exist (best effort).
+    /// `refresh_shortcut` rewrites an existing shortcut instead of keeping it.
+    fn register_install(dir: &Path, exe: &Path, refresh_shortcut: bool) {
+        if let Ok(lnk) = start_menu_shortcut_path(SHORTCUT_FILENAME) {
+            if refresh_shortcut || !lnk.exists() {
+                let _ = create_shortcut(&lnk, exe, dir, APP_DISPLAY_NAME);
+            }
         }
-        if let Ok(lnk) = desktop_shortcut_path(LEGACY_SHORTCUT_FILENAME) {
-            let _ = fs::remove_file(lnk);
-        }
-        let legacy_subkey_w = to_wide_null(LEGACY_UNINSTALL_REG_SUBKEY);
+        let _ = register_uninstall_entry(dir, exe);
+    }
+
+    fn message_box(text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+        let text_w = to_wide_null(text);
+        let title_w = to_wide_null(APP_DISPLAY_NAME);
         unsafe {
-            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(legacy_subkey_w.as_ptr()));
+            MessageBoxW(
+                HWND::default(),
+                PCWSTR(text_w.as_ptr()),
+                PCWSTR(title_w.as_ptr()),
+                style,
+            )
         }
     }
 
@@ -525,46 +531,26 @@ mod win32_impl {
     }
 
     fn run_uninstall(quiet: bool) {
-        if !quiet {
-            let prompt = to_wide_null(
+        if !quiet
+            && message_box(
                 "Uninstall QR Hub?\n\nYour saved printer settings will be kept.",
-            );
-            let title = to_wide_null(APP_DISPLAY_NAME);
-            let choice = unsafe {
-                MessageBoxW(
-                    HWND::default(),
-                    PCWSTR(prompt.as_ptr()),
-                    PCWSTR(title.as_ptr()),
-                    MB_YESNO | MB_ICONQUESTION,
-                )
-            };
-            if choice != IDYES {
-                return;
-            }
+                MB_YESNO | MB_ICONQUESTION,
+            ) != IDYES
+        {
+            return;
         }
 
-        if let Ok(lnk) = start_menu_shortcut_path(SHORTCUT_FILENAME) {
-            let _ = fs::remove_file(lnk);
-        }
-        if let Ok(lnk) = desktop_shortcut_path(SHORTCUT_FILENAME) {
-            let _ = fs::remove_file(lnk);
-        }
-
-        let subkey_w = to_wide_null(UNINSTALL_REG_SUBKEY);
-        unsafe {
-            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr()));
-        }
-
+        remove_shortcuts(SHORTCUT_FILENAME);
+        delete_reg_tree(UNINSTALL_REG_SUBKEY);
         cleanup_legacy_install_artifacts();
 
         if let Some(dir) = install_dir() {
             cleanup_old_binaries(&dir);
+            // Windows cannot remove a directory that is any process's working directory,
+            // and shortcuts launch QR Hub with the install dir as its CWD.
+            let _ = std::env::set_current_dir(std::env::temp_dir());
             let dest_exe = dir.join(INSTALLED_EXE_NAME);
-            let running_in_dir = std::env::current_exe()
-                .ok()
-                .is_some_and(|exe| paths_equivalent(&exe, &dest_exe));
-
-            if running_in_dir {
+            if is_running_from_install_dir() {
                 if self_replace::self_delete_outside_path(&dir).is_err() {
                     let _ = self_replace::self_delete();
                 }
@@ -575,16 +561,7 @@ mod win32_impl {
         }
 
         if !quiet {
-            let msg = to_wide_null("QR Hub has been uninstalled.");
-            let title = to_wide_null(APP_DISPLAY_NAME);
-            unsafe {
-                MessageBoxW(
-                    HWND::default(),
-                    PCWSTR(msg.as_ptr()),
-                    PCWSTR(title.as_ptr()),
-                    MB_OK | MB_ICONINFORMATION,
-                );
-            }
+            message_box("QR Hub has been uninstalled.", MB_OK | MB_ICONINFORMATION);
         }
     }
 
@@ -613,12 +590,7 @@ mod win32_impl {
         if paths_equivalent(&cur_exe, &dest_exe) {
             cleanup_old_binaries(&dest_dir);
             cleanup_legacy_install_artifacts();
-            if let Ok(lnk) = start_menu_shortcut_path(SHORTCUT_FILENAME) {
-                if !lnk.exists() {
-                    let _ = create_shortcut(&lnk, &dest_exe, &dest_dir, APP_DISPLAY_NAME);
-                }
-            }
-            let _ = register_uninstall_entry(&dest_dir, &dest_exe);
+            register_install(&dest_dir, &dest_exe, false);
             return StartupAction::RunApp {
                 just_installed: flags.just_installed,
                 just_updated: flags.just_updated,
@@ -629,26 +601,23 @@ mod win32_impl {
             .is_some_and(|legacy_exe| paths_equivalent(&cur_exe, &legacy_exe));
         let is_update_migration = from_legacy_install || flags.just_updated;
 
-        if !cfg!(debug_assertions) || flags.install {
-            if install_binary(&cur_exe, &dest_dir, &dest_exe).is_ok() {
-                cleanup_legacy_install_artifacts();
-                if let Ok(lnk) = start_menu_shortcut_path(SHORTCUT_FILENAME) {
-                    let _ = create_shortcut(&lnk, &dest_exe, &dest_dir, APP_DISPLAY_NAME);
-                }
-                let _ = register_uninstall_entry(&dest_dir, &dest_exe);
-                let launch_flag = if is_update_migration {
-                    "--just-updated"
-                } else {
-                    "--just-installed"
-                };
-                if Command::new(&dest_exe).arg(launch_flag).spawn().is_ok() {
-                    return StartupAction::Exit;
-                }
-                return StartupAction::RunApp {
-                    just_installed: !is_update_migration,
-                    just_updated: is_update_migration,
-                };
+        // Debug builds only self-install when explicitly asked to (`--install`).
+        let should_install = !cfg!(debug_assertions) || flags.install;
+        if should_install && install_binary(&cur_exe, &dest_dir, &dest_exe).is_ok() {
+            cleanup_legacy_install_artifacts();
+            register_install(&dest_dir, &dest_exe, true);
+            let launch_flag = if is_update_migration {
+                "--just-updated"
+            } else {
+                "--just-installed"
+            };
+            if Command::new(&dest_exe).arg(launch_flag).spawn().is_ok() {
+                return StartupAction::Exit;
             }
+            return StartupAction::RunApp {
+                just_installed: !is_update_migration,
+                just_updated: is_update_migration,
+            };
         }
 
         StartupAction::RunApp {
@@ -714,7 +683,10 @@ mod tests {
 
         let legacy = legacy_install_exe_path().expect("legacy install path should resolve");
         assert_eq!(legacy.file_name().unwrap(), LEGACY_EXE_NAME);
-        assert_eq!(legacy.parent().unwrap().file_name().unwrap(), LEGACY_INSTALL_DIR_NAME);
+        assert_eq!(
+            legacy.parent().unwrap().file_name().unwrap(),
+            LEGACY_INSTALL_DIR_NAME
+        );
     }
 
     #[test]

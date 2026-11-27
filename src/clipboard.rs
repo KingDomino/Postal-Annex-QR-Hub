@@ -11,11 +11,7 @@ pub const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 
 /// Retries an operation up to `max_retries` times (at least once), sleeping `backoff`
 /// between failed attempts.
-pub fn retry_with_backoff<F, E>(
-    max_retries: usize,
-    backoff: Duration,
-    mut op: F,
-) -> Result<(), E>
+pub fn retry_with_backoff<F, E>(max_retries: usize, backoff: Duration, mut op: F) -> Result<(), E>
 where
     F: FnMut() -> Result<(), E>,
 {
@@ -67,15 +63,14 @@ mod tests {
     #[test]
     fn retry_succeeds_after_transient_failures() {
         let mut attempts = 0usize;
-        let res: Result<(), &'static str> =
-            retry_with_backoff(5, Duration::ZERO, || {
-                attempts += 1;
-                if attempts < 3 {
-                    Err("OpenClipboard locked")
-                } else {
-                    Ok(())
-                }
-            });
+        let res: Result<(), &'static str> = retry_with_backoff(5, Duration::ZERO, || {
+            attempts += 1;
+            if attempts < 3 {
+                Err("OpenClipboard locked")
+            } else {
+                Ok(())
+            }
+        });
         assert_eq!(res, Ok(()));
         assert_eq!(attempts, 3);
     }

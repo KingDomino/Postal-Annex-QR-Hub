@@ -7,11 +7,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::config::{config_dir, DEFAULT_GITHUB_REPO};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
-use crate::config::{config_dir, DEFAULT_GITHUB_REPO};
 
 /// Current application version from `Cargo.toml`.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -81,15 +79,6 @@ pub fn current_arch_label() -> &'static str {
     }
 }
 
-/// Maps a target architecture identifier to its expected Windows release `.exe` filename.
-pub fn expected_asset_for_arch(arch: &str) -> Result<&'static str, String> {
-    match arch.trim().to_ascii_lowercase().as_str() {
-        "x86_64" | "x64" | "amd64" => Ok(ASSET_X64),
-        "aarch64" | "arm64" => Ok(ASSET_ARM64),
-        other => Err(format!("Unsupported architecture for auto-update: {other}")),
-    }
-}
-
 /// Compares `current` version against a GitHub release `candidate_tag` (with or without leading `v`).
 /// Returns `Ok(true)` iff `candidate_tag` is strictly newer than `current`.
 pub fn is_newer_version(current: &str, candidate_tag: &str) -> Result<bool, String> {
@@ -100,7 +89,8 @@ pub fn is_newer_version(current: &str, candidate_tag: &str) -> Result<bool, Stri
     Ok(cand > cur)
 }
 
-fn strip_v_prefix(raw: &str) -> &str {
+/// Trims whitespace and one leading `v`/`V` from a version tag (`" v2.0.3"` -> `"2.0.3"`).
+pub fn strip_v_prefix(raw: &str) -> &str {
     let trimmed = raw.trim();
     trimmed
         .strip_prefix('v')
@@ -117,11 +107,10 @@ pub fn parse_checksum_for_asset(checksums_txt: &str, asset_name: &str) -> Option
             continue;
         }
         let mut parts = trimmed.split_whitespace();
-        let hash = parts.next()?;
-        let raw_name = parts.next()?;
-        let normalized_name = raw_name
-            .trim_start_matches('*')
-            .trim_start_matches("./");
+        let (Some(hash), Some(raw_name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let normalized_name = raw_name.trim_start_matches('*').trim_start_matches("./");
         if normalized_name == asset_name
             && hash.len() == 64
             && hash.bytes().all(|b| b.is_ascii_hexdigit())
@@ -132,44 +121,29 @@ pub fn parse_checksum_for_asset(checksums_txt: &str, asset_name: &str) -> Option
     None
 }
 
-/// Computes the lowercase hexadecimal SHA-256 digest of `bytes`.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    bytes_to_hex(&digest)
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-/// Verifies that `bytes` matches `expected_hex` (case-insensitive).
-pub fn verify_sha256(bytes: &[u8], expected_hex: &str) -> Result<(), String> {
-    let actual = sha256_hex(bytes);
-    let expected = expected_hex.trim().to_ascii_lowercase();
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(format!(
-            "SHA-256 checksum mismatch: expected {expected}, got {actual}"
-        ))
-    }
-}
-
 /// Builds the GitHub Issues URL for `repo`, falling back to [`DEFAULT_GITHUB_REPO`] when empty.
 pub fn issues_url(repo: &str) -> String {
-    let trimmed = repo.trim().trim_end_matches('/');
-    let cleaned = if trimmed.is_empty() {
-        DEFAULT_GITHUB_REPO
-    } else {
-        trimmed
+    let repo = normalize_repo(repo).unwrap_or(DEFAULT_GITHUB_REPO);
+    format!("https://github.com/{repo}/issues")
+}
+
+/// Normalizes a user-entered repository to `owner/repo`, accepting a pasted
+/// `https://github.com/owner/repo` URL. Returns `None` for anything else, so stray
+/// scanner input in the Settings field can never be spliced into an API URL.
+pub fn normalize_repo(repo: &str) -> Option<&str> {
+    let repo = repo.trim();
+    let repo = ["https://github.com/", "http://github.com/", "github.com/"]
+        .iter()
+        .find_map(|prefix| repo.strip_prefix(prefix))
+        .unwrap_or(repo)
+        .trim_matches('/');
+    let valid_segment = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     };
-    format!("https://github.com/{cleaned}/issues")
+    let (owner, name) = repo.split_once('/')?;
+    (valid_segment(owner) && valid_segment(name)).then_some(repo)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,27 +269,29 @@ pub fn select_unread_changelogs(
 
 /// Builds the initial offline/cached list of unread changelogs from `last_seen` up to `current`.
 pub fn initial_unread_changelogs(last_seen: Option<&str>, current: &str) -> Vec<VersionChangelog> {
-    let mut candidates = Vec::new();
-    if let Some(cached) = load_cached_changelog(current) {
-        candidates.push(VersionChangelog {
-            version: strip_v_prefix(current).to_string(),
-            notes: cached,
-        });
-    }
-    for &(ver, notes) in EMBEDDED_CHANGELOGS {
-        candidates.push(VersionChangelog {
-            version: ver.to_string(),
+    select_unread_changelogs(last_seen, current, local_changelogs(current))
+}
+
+/// Offline changelog sources: cached notes for `current` (if any), then the embedded notes.
+fn local_changelogs(current: &str) -> Vec<VersionChangelog> {
+    let current = strip_v_prefix(current);
+    let cached = load_cached_changelog(current).map(|notes| VersionChangelog {
+        version: current.to_string(),
+        notes,
+    });
+    let embedded = EMBEDDED_CHANGELOGS
+        .iter()
+        .map(|&(version, notes)| VersionChangelog {
+            version: version.to_string(),
             notes: notes.to_string(),
         });
-    }
-    select_unread_changelogs(last_seen, current, candidates)
+    cached.into_iter().chain(embedded).collect()
 }
 
 /// Metadata for a newer release ready to be downloaded and installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableUpdate {
     pub version: String,
-    pub tag_name: String,
     pub asset_name: String,
     pub asset_url: String,
     pub checksums_url: String,
@@ -342,13 +318,24 @@ pub enum UpdateCommand {
 #[derive(Debug, Clone)]
 pub enum UpdateEvent {
     Checking,
-    UpToDate { silent: bool },
+    UpToDate {
+        silent: bool,
+    },
     Available(AvailableUpdate),
-    DownloadProgress { downloaded: u64, total: Option<u64> },
+    DownloadProgress {
+        downloaded: u64,
+        total: Option<u64>,
+    },
     Verifying,
     ReadyToRestart,
     ChangelogsLoaded(Vec<VersionChangelog>),
-    Error { message: String, silent: bool },
+    /// An update *check* failed (`silent` for background checks).
+    Error {
+        message: String,
+        silent: bool,
+    },
+    /// Downloading, verifying, or applying an update failed.
+    InstallFailed(String),
 }
 
 /// Background worker thread for checking, downloading, verifying, and applying updates.
@@ -454,409 +441,295 @@ impl UpdateWorker {
 }
 
 #[cfg(feature = "online-updater")]
-#[derive(serde::Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    body: Option<String>,
-    assets: Vec<GithubAsset>,
-}
-
-#[cfg(feature = "online-updater")]
-#[derive(serde::Deserialize)]
-struct GithubAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[cfg(feature = "online-updater")]
-fn user_agent() -> String {
-    format!("QRHub/{CURRENT_VERSION}")
-}
-
-#[cfg(feature = "online-updater")]
-fn run_check(repo: &str, silent: bool, emit: &dyn Fn(UpdateEvent) -> bool) {
-    let repo_trimmed = repo.trim();
-    if repo_trimmed.is_empty() {
-        let _ = emit(UpdateEvent::Error {
-            message: "GitHub repository is not configured.".to_string(),
-            silent,
-        });
-        return;
-    }
-
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .user_agent(user_agent())
-        .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!("Failed to initialize HTTP client: {err}"),
-                silent,
-            });
-            return;
-        }
-    };
-
-    let url = format!("https://api.github.com/repos/{repo_trimmed}/releases/latest");
-    let resp = match client.get(&url).send() {
-        Ok(r) => r,
-        Err(err) => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!("Could not reach GitHub Releases: {err}"),
-                silent,
-            });
-            return;
-        }
-    };
-
-    if !resp.status().is_success() {
-        let _ = emit(UpdateEvent::Error {
-            message: format!("GitHub Releases returned HTTP {}", resp.status()),
-            silent,
-        });
-        return;
-    }
-
-    let release: GithubRelease = match resp.json() {
-        Ok(r) => r,
-        Err(err) => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!("Invalid GitHub release payload: {err}"),
-                silent,
-            });
-            return;
-        }
-    };
-
-    match is_newer_version(CURRENT_VERSION, &release.tag_name) {
-        Ok(false) => {
-            let _ = emit(UpdateEvent::UpToDate { silent });
-            return;
-        }
-        Err(err) => {
-            let _ = emit(UpdateEvent::Error {
-                message: err,
-                silent,
-            });
-            return;
-        }
-        Ok(true) => {}
-    }
-
-    let asset = release.assets.iter().find(|a| a.name == EXPECTED_ASSET);
-    let checksums = release.assets.iter().find(|a| a.name == CHECKSUMS_ASSET);
-
-    match (asset, checksums) {
-        (Some(bin), Some(chk)) => {
-            let _ = emit(UpdateEvent::Available(AvailableUpdate {
-                version: strip_v_prefix(&release.tag_name).to_string(),
-                tag_name: release.tag_name,
-                asset_name: bin.name.clone(),
-                asset_url: bin.browser_download_url.clone(),
-                checksums_url: chk.browser_download_url.clone(),
-                release_notes: release.body,
-            }));
-        }
-        (None, _) => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!(
-                    "Release {} does not contain an installer for {} ({EXPECTED_ASSET}).",
-                    release.tag_name,
-                    current_arch_label()
-                ),
-                silent,
-            });
-        }
-        (_, None) => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!(
-                    "Release {} is missing required {CHECKSUMS_ASSET} manifest.",
-                    release.tag_name
-                ),
-                silent,
-            });
-        }
-    }
-}
-
-#[cfg(feature = "online-updater")]
-fn run_install(update: &AvailableUpdate, emit: &dyn Fn(UpdateEvent) -> bool) {
+mod online {
     use std::fs::{self, File};
     use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .user_agent(user_agent())
-        .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!("Failed to initialize download client: {err}"),
-                silent: false,
-            });
-            return;
-        }
-    };
+    use serde::Deserialize;
+    use sha2::{Digest, Sha256};
 
-    // 1. Download checksums.txt and locate the expected SHA-256 for this architecture.
-    let checksums_text = match client
-        .get(&update.checksums_url)
-        .timeout(Duration::from_secs(15))
-        .send()
-        .and_then(|r| r.error_for_status())
-        .and_then(|r| r.text())
-    {
-        Ok(text) => text,
-        Err(err) => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!("Failed to download {CHECKSUMS_ASSET}: {err}"),
-                silent: false,
-            });
-            return;
-        }
-    };
+    use super::*;
 
-    let expected_hash = match parse_checksum_for_asset(&checksums_text, &update.asset_name) {
-        Some(h) => h,
-        None => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!(
-                    "Checksum for {} was not found in {CHECKSUMS_ASSET}.",
-                    update.asset_name
-                ),
-                silent: false,
-            });
-            return;
-        }
-    };
-
-    // 2. Stream download binary into %TEMP% while computing SHA-256.
-    let mut resp = match client
-        .get(&update.asset_url)
-        .send()
-        .and_then(|r| r.error_for_status())
-    {
-        Ok(r) => r,
-        Err(err) => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!("Failed to download update binary: {err}"),
-                silent: false,
-            });
-            return;
-        }
-    };
-
-    let total = resp.content_length();
-    let temp_path = std::env::temp_dir().join(format!(
-        "QR-Hub-update-{}-{}.exe",
-        std::process::id(),
-        update.version.replace(['/', '\\', ' '], "_")
-    ));
-
-    let mut file = match File::create(&temp_path) {
-        Ok(f) => f,
-        Err(err) => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!("Failed to create temporary update file: {err}"),
-                silent: false,
-            });
-            return;
-        }
-    };
-
-    let mut hasher = Sha256::new();
-    let mut downloaded: u64 = 0;
-    let mut last_reported: u64 = 0;
-    let mut chunk = [0u8; 32 * 1024];
-
-    loop {
-        match resp.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                if let Err(err) = file.write_all(&chunk[..n]) {
-                    drop(file);
-                    let _ = fs::remove_file(&temp_path);
-                    let _ = emit(UpdateEvent::Error {
-                        message: format!("Failed writing update file: {err}"),
-                        silent: false,
-                    });
-                    return;
-                }
-                hasher.update(&chunk[..n]);
-                downloaded += n as u64;
-                if downloaded.saturating_sub(last_reported) >= 64 * 1024
-                    || total.is_some_and(|t| downloaded >= t)
-                {
-                    last_reported = downloaded;
-                    let _ = emit(UpdateEvent::DownloadProgress { downloaded, total });
-                }
-            }
-            Err(err) => {
-                drop(file);
-                let _ = fs::remove_file(&temp_path);
-                let _ = emit(UpdateEvent::Error {
-                    message: format!("Download interrupted: {err}"),
-                    silent: false,
-                });
-                return;
-            }
-        }
-    }
-
-    if let Err(err) = file.flush() {
-        drop(file);
-        let _ = fs::remove_file(&temp_path);
-        let _ = emit(UpdateEvent::Error {
-            message: format!("Failed to flush downloaded update: {err}"),
-            silent: false,
-        });
-        return;
-    }
-    drop(file);
-
-    // 3. Verify SHA-256 digest before touching the running binary.
-    let _ = emit(UpdateEvent::Verifying);
-    let actual_hash = bytes_to_hex(&hasher.finalize());
-    if actual_hash != expected_hash {
-        let _ = fs::remove_file(&temp_path);
-        let _ = emit(UpdateEvent::Error {
-            message: format!(
-                "Update aborted: SHA-256 verification failed (expected {expected_hash}, got {actual_hash})."
-            ),
-            silent: false,
-        });
-        return;
-    }
-
-    // 4. Cache release notes before replacing, then atomically self-replace and relaunch.
-    if let Some(notes) = update
-        .release_notes
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let _ = save_cached_changelog(&update.version, notes);
-    }
-
-    if let Err(err) = self_replace::self_replace(&temp_path) {
-        let _ = fs::remove_file(&temp_path);
-        let _ = emit(UpdateEvent::Error {
-            message: format!("Failed to replace running executable: {err}"),
-            silent: false,
-        });
-        return;
-    }
-    let _ = fs::remove_file(&temp_path);
-
-    match std::env::current_exe() {
-        Ok(exe_path) => {
-            if let Err(err) = std::process::Command::new(&exe_path)
-                .arg("--just-updated")
-                .spawn()
-            {
-                let _ = emit(UpdateEvent::Error {
-                    message: format!("Update installed, but automatic restart failed: {err}"),
-                    silent: false,
-                });
-                return;
-            }
-            let _ = emit(UpdateEvent::ReadyToRestart);
-        }
-        Err(err) => {
-            let _ = emit(UpdateEvent::Error {
-                message: format!("Update installed, but could not locate executable path: {err}"),
-                silent: false,
-            });
-        }
-    }
-}
-
-#[cfg(feature = "online-updater")]
-fn run_fetch_changelog(
-    repo: &str,
-    since_version: Option<&str>,
-    current_version: &str,
-    emit: &dyn Fn(UpdateEvent) -> bool,
-) {
-    let repo_trimmed = repo.trim().trim_end_matches('/');
-    let cur = strip_v_prefix(current_version);
-    if repo_trimmed.is_empty() || cur.is_empty() {
-        return;
-    }
-
-    let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .user_agent(user_agent())
-        .build()
-    else {
-        return;
-    };
-
-    let url = format!("https://api.github.com/repos/{repo_trimmed}/releases?per_page=20");
-    let Ok(resp) = client.get(&url).send() else {
-        return;
-    };
-    if !resp.status().is_success() {
-        return;
-    }
+    /// Emit a progress event at most once per this many downloaded bytes.
+    const PROGRESS_STEP_BYTES: u64 = 64 * 1024;
 
     #[derive(Deserialize)]
-    struct ReleaseListItem {
+    struct GithubRelease {
         tag_name: String,
         body: Option<String>,
         #[serde(default)]
         draft: bool,
+        #[serde(default)]
+        assets: Vec<GithubAsset>,
     }
 
-    let Ok(releases) = resp.json::<Vec<ReleaseListItem>>() else {
-        return;
-    };
+    #[derive(Deserialize)]
+    struct GithubAsset {
+        name: String,
+        browser_download_url: String,
+    }
 
-    let mut candidates = Vec::new();
-    for item in releases {
-        if item.draft {
-            continue;
+    /// Lowercase hex encoding, matching the digests in `checksums.txt`.
+    pub(super) fn bytes_to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Deletes the temporary download on every exit path (success included).
+    struct TempFile(PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
         }
-        if let Some(notes) = item
-            .body
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+    }
+
+    fn http_client(timeout: Duration) -> reqwest::Result<reqwest::blocking::Client> {
+        reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .https_only(true)
+            .user_agent(format!("QRHub/{CURRENT_VERSION}"))
+            .build()
+    }
+
+    pub(super) fn run_check(repo: &str, silent: bool, emit: &dyn Fn(UpdateEvent) -> bool) {
+        let event = match check_latest_release(repo) {
+            Ok(Some(update)) => UpdateEvent::Available(update),
+            Ok(None) => UpdateEvent::UpToDate { silent },
+            Err(message) => UpdateEvent::Error { message, silent },
+        };
+        let _ = emit(event);
+    }
+
+    /// Returns `Some(update)` when the latest GitHub release is newer than this build.
+    fn check_latest_release(repo: &str) -> Result<Option<AvailableUpdate>, String> {
+        let repo = normalize_repo(repo).ok_or_else(|| {
+            "GitHub repository must look like owner/repo (check Settings).".to_string()
+        })?;
+
+        let client = http_client(Duration::from_secs(5))
+            .map_err(|e| format!("Failed to initialize HTTP client: {e}"))?;
+        let resp = client
+            .get(format!(
+                "https://api.github.com/repos/{repo}/releases/latest"
+            ))
+            .send()
+            .map_err(|e| format!("Could not reach GitHub Releases: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("GitHub Releases returned HTTP {}", resp.status()));
+        }
+        let release: GithubRelease = resp
+            .json()
+            .map_err(|e| format!("Invalid GitHub release payload: {e}"))?;
+
+        if !is_newer_version(CURRENT_VERSION, &release.tag_name)? {
+            return Ok(None);
+        }
+
+        let find_asset = |name: &str| release.assets.iter().find(|a| a.name == name);
+        let binary = find_asset(EXPECTED_ASSET).ok_or_else(|| {
+            format!(
+                "Release {} does not contain an installer for {} ({EXPECTED_ASSET}).",
+                release.tag_name,
+                current_arch_label()
+            )
+        })?;
+        let checksums = find_asset(CHECKSUMS_ASSET).ok_or_else(|| {
+            format!(
+                "Release {} is missing required {CHECKSUMS_ASSET} manifest.",
+                release.tag_name
+            )
+        })?;
+
+        Ok(Some(AvailableUpdate {
+            version: strip_v_prefix(&release.tag_name).to_string(),
+            asset_name: binary.name.clone(),
+            asset_url: binary.browser_download_url.clone(),
+            checksums_url: checksums.browser_download_url.clone(),
+            release_notes: release.body,
+        }))
+    }
+
+    pub(super) fn run_install(update: &AvailableUpdate, emit: &dyn Fn(UpdateEvent) -> bool) {
+        if let Err(message) = install_update(update, emit) {
+            let _ = emit(UpdateEvent::InstallFailed(message));
+        }
+    }
+
+    /// Downloads, verifies SHA-256, self-replaces the binary, and relaunches it.
+    fn install_update(
+        update: &AvailableUpdate,
+        emit: &dyn Fn(UpdateEvent) -> bool,
+    ) -> Result<(), String> {
+        let client = http_client(Duration::from_secs(120))
+            .map_err(|e| format!("Failed to initialize download client: {e}"))?;
+
+        // 1. Look up the expected SHA-256 for this architecture.
+        let checksums_text = client
+            .get(&update.checksums_url)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.text())
+            .map_err(|e| format!("Failed to download {CHECKSUMS_ASSET}: {e}"))?;
+        let expected_hash = parse_checksum_for_asset(&checksums_text, &update.asset_name)
+            .ok_or_else(|| {
+                format!(
+                    "Checksum for {} was not found in {CHECKSUMS_ASSET}.",
+                    update.asset_name
+                )
+            })?;
+
+        // 2. Stream the binary into %TEMP% while hashing it.
+        let temp = TempFile(std::env::temp_dir().join(format!(
+            "QR-Hub-update-{}-{}.exe",
+            std::process::id(),
+            update.version.replace(['/', '\\', ' '], "_")
+        )));
+        let actual_hash = download_hashed(&client, &update.asset_url, &temp.0, emit)?;
+
+        // 3. Verify before touching the running binary.
+        let _ = emit(UpdateEvent::Verifying);
+        if actual_hash != expected_hash {
+            return Err(format!(
+                "Update aborted: SHA-256 verification failed (expected {expected_hash}, got {actual_hash})."
+            ));
+        }
+
+        // 4. Cache release notes, swap the executable, and relaunch.
+        if let Some(notes) = update.release_notes.as_deref() {
+            let _ = save_cached_changelog(&update.version, notes);
+        }
+        let exe_path = std::env::current_exe()
+            .map_err(|e| format!("Could not locate the running executable: {e}"))?;
+        if let Err(e) = self_replace::self_replace(&temp.0) {
+            // self_replace moves the old exe aside before copying the new one in. If that
+            // copy failed, nothing is left at `exe_path` and the old binary is deleted on
+            // exit, so restore from the verified download while we still have it.
+            if !exe_path.exists() && fs::copy(&temp.0, &exe_path).is_err() {
+                return Err(format!(
+                    "Update failed and QR Hub could not be restored ({e}). Please reinstall it from GitHub Releases."
+                ));
+            }
+            return Err(format!("Failed to replace running executable: {e}"));
+        }
+        drop(temp);
+
+        let mut relaunch = std::process::Command::new(&exe_path);
+        relaunch.arg("--just-updated");
+        if std::env::args()
+            .any(|a| matches!(a.to_ascii_lowercase().as_str(), "--portable" | "/portable"))
         {
-            candidates.push(VersionChangelog {
-                version: strip_v_prefix(&item.tag_name).to_string(),
-                notes: notes.to_string(),
-            });
+            relaunch.arg("--portable");
+        }
+        relaunch.spawn().map_err(|e| {
+            format!(
+                "Update installed. Please close and reopen QR Hub (automatic restart failed: {e})."
+            )
+        })?;
+        let _ = emit(UpdateEvent::ReadyToRestart);
+        Ok(())
+    }
+
+    /// Streams `url` into `dest`, reporting progress, and returns the lowercase SHA-256 hex.
+    fn download_hashed(
+        client: &reqwest::blocking::Client,
+        url: &str,
+        dest: &Path,
+        emit: &dyn Fn(UpdateEvent) -> bool,
+    ) -> Result<String, String> {
+        let mut resp = client
+            .get(url)
+            .send()
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| format!("Failed to download update binary: {e}"))?;
+        let total = resp.content_length();
+        let mut file = File::create(dest)
+            .map_err(|e| format!("Failed to create temporary update file: {e}"))?;
+
+        let mut hasher = Sha256::new();
+        let mut downloaded: u64 = 0;
+        let mut last_reported: u64 = 0;
+        let mut chunk = [0u8; 32 * 1024];
+        loop {
+            let n = match resp.read(&mut chunk) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("Download interrupted: {e}")),
+            };
+            if n == 0 {
+                break;
+            }
+            file.write_all(&chunk[..n])
+                .map_err(|e| format!("Failed writing update file: {e}"))?;
+            hasher.update(&chunk[..n]);
+            downloaded += n as u64;
+            if downloaded - last_reported >= PROGRESS_STEP_BYTES
+                || total.is_some_and(|t| downloaded >= t)
+            {
+                last_reported = downloaded;
+                let _ = emit(UpdateEvent::DownloadProgress { downloaded, total });
+            }
+        }
+        file.flush()
+            .map_err(|e| format!("Failed to flush downloaded update: {e}"))?;
+        Ok(bytes_to_hex(&hasher.finalize()))
+    }
+
+    pub(super) fn run_fetch_changelog(
+        repo: &str,
+        since_version: Option<&str>,
+        current_version: &str,
+        emit: &dyn Fn(UpdateEvent) -> bool,
+    ) {
+        let current = strip_v_prefix(current_version);
+        if current.is_empty() {
+            return;
+        }
+        let Some(mut candidates) = fetch_release_notes(repo).filter(|c| !c.is_empty()) else {
+            return;
+        };
+        // Live GitHub notes come first so they win; local notes cover unpublished versions.
+        candidates.extend(local_changelogs(current));
+        let selected = select_unread_changelogs(since_version, current, candidates);
+        if !selected.is_empty() {
+            let _ = emit(UpdateEvent::ChangelogsLoaded(selected));
         }
     }
 
-    if candidates.is_empty() {
-        return;
-    }
-
-    // Include cached/embedded notes after live GitHub notes so any local/untagged current
-    // release stays included while published GitHub release notes take priority.
-    if let Some(cached) = load_cached_changelog(cur) {
-        candidates.push(VersionChangelog {
-            version: cur.to_string(),
-            notes: cached,
-        });
-    }
-    for &(ver, notes) in EMBEDDED_CHANGELOGS {
-        candidates.push(VersionChangelog {
-            version: ver.to_string(),
-            notes: notes.to_string(),
-        });
-    }
-
-    let selected = select_unread_changelogs(since_version, cur, candidates);
-    if !selected.is_empty() {
-        let _ = emit(UpdateEvent::ChangelogsLoaded(selected));
+    /// Fetches non-empty release notes for the 20 most recent non-draft releases.
+    fn fetch_release_notes(repo: &str) -> Option<Vec<VersionChangelog>> {
+        let repo = normalize_repo(repo)?;
+        let resp = http_client(Duration::from_secs(5))
+            .ok()?
+            .get(format!(
+                "https://api.github.com/repos/{repo}/releases?per_page=20"
+            ))
+            .send()
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let releases: Vec<GithubRelease> = resp.json().ok()?;
+        Some(
+            releases
+                .into_iter()
+                .filter(|r| !r.draft)
+                .filter_map(|r| {
+                    let notes = r.body.as_deref()?.trim();
+                    (!notes.is_empty()).then(|| VersionChangelog {
+                        version: strip_v_prefix(&r.tag_name).to_string(),
+                        notes: notes.to_string(),
+                    })
+                })
+                .collect(),
+        )
     }
 }
+
+#[cfg(feature = "online-updater")]
+use online::{run_check, run_fetch_changelog, run_install};
 
 #[cfg(not(feature = "online-updater"))]
 fn run_check(_repo: &str, silent: bool, emit: &dyn Fn(UpdateEvent) -> bool) {
@@ -868,10 +741,9 @@ fn run_check(_repo: &str, silent: bool, emit: &dyn Fn(UpdateEvent) -> bool) {
 
 #[cfg(not(feature = "online-updater"))]
 fn run_install(_update: &AvailableUpdate, emit: &dyn Fn(UpdateEvent) -> bool) {
-    let _ = emit(UpdateEvent::Error {
-        message: "Online auto-updater is disabled in this build.".to_string(),
-        silent: false,
-    });
+    let _ = emit(UpdateEvent::InstallFailed(
+        "Online auto-updater is disabled in this build.".to_string(),
+    ));
 }
 
 #[cfg(not(feature = "online-updater"))]
@@ -886,20 +758,48 @@ fn run_fetch_changelog(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn selects_correct_windows_asset_per_architecture() {
         assert_eq!(ASSET_X64, "QR-Hub-windows-x64.exe");
         assert_eq!(ASSET_ARM64, "QR-Hub-windows-arm64.exe");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(EXPECTED_ASSET, ASSET_ARM64);
+        #[cfg(not(target_arch = "aarch64"))]
+        assert_eq!(EXPECTED_ASSET, ASSET_X64);
+    }
+
+    #[test]
+    fn newest_embedded_changelog_matches_cargo_version() {
+        // Bumping Cargo.toml without adding notes would show stale notes under a new header.
+        assert_eq!(EMBEDDED_CHANGELOGS[0].0, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn normalize_repo_accepts_owner_repo_and_urls_only() {
+        assert_eq!(normalize_repo(" Owner/Repo/ "), Some("Owner/Repo"));
         assert_eq!(
-            expected_asset_for_arch("x86_64").unwrap(),
-            "QR-Hub-windows-x64.exe"
+            normalize_repo("https://github.com/KingDomino/Postal-Annex-QR-Hub"),
+            Some("KingDomino/Postal-Annex-QR-Hub")
         );
+        assert_eq!(normalize_repo("my.org/my_repo-2"), Some("my.org/my_repo-2"));
+        for bad in [
+            "",
+            "owner",
+            "/repo",
+            "a/b/c",
+            "a/b?x=1",
+            "a/b#frag",
+            "a b/c",
+            "owner/repoAFNLFBF|RMA1",
+        ] {
+            assert_eq!(normalize_repo(bad), None, "{bad:?} should be rejected");
+        }
         assert_eq!(
-            expected_asset_for_arch("aarch64").unwrap(),
-            "QR-Hub-windows-arm64.exe"
+            issues_url("garbage"),
+            format!("https://github.com/{DEFAULT_GITHUB_REPO}/issues")
         );
-        assert!(expected_asset_for_arch("riscv64").is_err());
     }
 
     #[test]
@@ -1018,7 +918,10 @@ mod tests {
     #[test]
     fn checksum_parsing_and_verification_accepts_match_and_rejects_mismatch() {
         let payload = b"PostalAnnex+ test binary contents";
-        let valid_hash = sha256_hex(payload);
+        let valid_hash: String = Sha256::digest(payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let other_hash = "0".repeat(64);
 
         let manifest = format!(
@@ -1035,9 +938,18 @@ mod tests {
         );
         assert_eq!(parse_checksum_for_asset(&manifest, "unknown.exe"), None);
 
-        assert!(verify_sha256(payload, &valid_hash).is_ok());
-        assert!(verify_sha256(payload, &valid_hash.to_uppercase()).is_ok());
-        assert!(verify_sha256(payload, &other_hash).is_err());
-        assert!(verify_sha256(b"tampered bytes", &valid_hash).is_err());
+        // A malformed line must not abort the search for later valid entries.
+        let messy = format!("garbage\n{valid_hash} *./{ASSET_X64}\n");
+        assert_eq!(
+            parse_checksum_for_asset(&messy, ASSET_X64),
+            Some(valid_hash.clone())
+        );
+
+        // Uppercase digests in the manifest are normalized to match our lowercase hex.
+        let upper = format!("{}  {ASSET_X64}\n", valid_hash.to_uppercase());
+        assert_eq!(
+            parse_checksum_for_asset(&upper, ASSET_X64),
+            Some(valid_hash.clone())
+        );
     }
 }
