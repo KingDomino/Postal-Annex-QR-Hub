@@ -16,6 +16,24 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Embedded release notes for the current version, used as an offline fallback for "What's New?".
 pub const CURRENT_CHANGELOG: &str = "\
+- Fixed scans being ignored while the \"What's New?\" window was open (scanning now closes it and processes the code)\n\
+- Fixed old print and clipboard errors staying on screen after scanning the next package\n\
+- Fixed the \"Copied\" badge showing even when the clipboard was busy and nothing was copied (it now shows a red warning to use Copy All)\n\
+- Fixed \"&\" disappearing from printed label headers\n\
+- Print errors now name the label that failed to print\n\
+- The QR preview now explains why a code could not be generated\n\
+- Fixed settings changes being lost if the app was closed right after making them\n\
+- Fixed saved settings being silently wiped if the settings file got damaged (the old file is now kept and a warning is shown)\n\
+- Fixed an update check that finishes during an update from interrupting the install\n\
+- Updates now recover the app if installing a new version fails partway through\n\
+- Updates are now only downloaded over secure connections, and the GitHub repository setting is checked for typos\n\
+- Fixed the uninstaller leaving an empty QR Hub folder behind\n\
+- Improved printer reliability on Windows, plus general code cleanup and stability fixes";
+
+const CHANGELOG_2_0_4: &str = "\
+- Added an update channel setting so a PC can test new versions before they are released to every store";
+
+const CHANGELOG_2_0_3: &str = "\
 - Statically linked the Windows C runtime to fix startup errors on clean Windows and ARM64 machines\n\
 - Updated \"What's New?\" to show all unread release changelogs with separate headers per version when skipping updates\n\
 - Updated Happy Returns printed label header to \"UPS Happy Returns\"\n\
@@ -30,8 +48,12 @@ const CHANGELOG_2_0_2: &str = "\
 - Changed codebase to be more coherent";
 
 /// Embedded release notes by version (newest first), used offline and when a release tag is not yet published.
-pub const EMBEDDED_CHANGELOGS: &[(&str, &str)] =
-    &[("2.0.3", CURRENT_CHANGELOG), ("2.0.2", CHANGELOG_2_0_2)];
+pub const EMBEDDED_CHANGELOGS: &[(&str, &str)] = &[
+    ("2.1.0", CURRENT_CHANGELOG),
+    ("2.0.4", CHANGELOG_2_0_4),
+    ("2.0.3", CHANGELOG_2_0_3),
+    ("2.0.2", CHANGELOG_2_0_2),
+];
 
 /// A single version's changelog section shown inside the "What's New?" dialog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -895,9 +917,10 @@ mod tests {
     #[test]
     fn current_changelog_is_populated() {
         assert!(CURRENT_CHANGELOG.contains("What's New?"));
-        assert!(CURRENT_CHANGELOG.contains("UPS Happy Returns"));
-        assert!(CURRENT_CHANGELOG.contains("UNPK-"));
-        assert!(CURRENT_CHANGELOG.contains("1Z"));
+        assert!(CHANGELOG_2_0_4.contains("update channel"));
+        assert!(CHANGELOG_2_0_3.contains("UPS Happy Returns"));
+        assert!(CHANGELOG_2_0_3.contains("UNPK-"));
+        assert!(CHANGELOG_2_0_3.contains("1Z"));
     }
 
     #[test]
