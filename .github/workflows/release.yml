@@ -6,8 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# Least privilege: build jobs run third-party build scripts, so only `publish` can write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -67,6 +68,8 @@ jobs:
     name: Generate Checksums & Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Download built Windows executables
