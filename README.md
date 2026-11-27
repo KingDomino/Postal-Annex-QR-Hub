@@ -13,16 +13,18 @@ Native, offline-first Windows desktop application written in Rust (`eframe` / `e
 ## Installation (Windows x64 & ARM64)
 
 1. Download the matching executable from [GitHub Releases](https://github.com/KingDomino/Postal-Annex-QR-Hub/releases):
-   - **Standard Windows PCs (Intel / AMD 64-bit):** `QR-Hub-windows-x64.exe`
+   - **Standard Windows PCs (Intel / AMD 64-bit) Most Common Option, Choose This if Unsure:** `QR-Hub-windows-x64.exe`
    - **Windows on ARM64 (Snapdragon / Surface ARM):** `QR-Hub-windows-arm64.exe`
 2. Double-click the downloaded `.exe` (no administrator/UAC prompt required).
    - It automatically installs into `%LOCALAPPDATA%\QR Hub\QR Hub.exe`, creates a **QR Hub** shortcut in the Start Menu, registers in **Installed Apps**, migrates any legacy settings, and launches ready to use.
    - Optionally click **Add Desktop Shortcut** from the first-run banner or **Settings**.
 3. Open **Settings** (top-right gear icon) to select your 4" x 6" thermal printer (e.g., `ZDesigner GK420d`) and print a test label.
 
-### Auto-Updates & "What's New?"
+### Auto-Updates
 
 When a newer version is published on GitHub Releases, an **Update available** banner appears cleanly at the top of the window (and in **Settings → Updates & Info**). Clicking **Update & Restart** downloads the matching architecture binary, verifies its SHA-256 digest against `checksums.txt`, atomically swaps the installed executable in `%LOCALAPPDATA%\QR Hub\`, restarts automatically with all Start Menu and Desktop shortcuts intact, and opens the **"What's New?"** release notes dialog.
+
+If auto-updates do not work for you, please try reinstalling the app. If you have consistent issues with auto updates, please report an issue on the GitHub page.
 
 ### Command-Line Options
 
