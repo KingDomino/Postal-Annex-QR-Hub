@@ -21,12 +21,10 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             asset_name: QR-Hub-windows-x64.exe
-            legacy_asset_name: PostalAnnexQRScanner-windows-x64.exe
           - arch_label: windows-arm64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
             asset_name: QR-Hub-windows-arm64.exe
-            legacy_asset_name: PostalAnnexQRScanner-windows-arm64.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -55,7 +53,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\QR-Hub.exe" "dist\${{ matrix.asset_name }}"
-          Copy-Item "target\${{ matrix.target }}\release\QR-Hub.exe" "dist\${{ matrix.legacy_asset_name }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -81,12 +78,7 @@ jobs:
       - name: Generate SHA-256 checksums.txt
         working-directory: release-artifacts
         run: |
-          sha256sum \
-            QR-Hub-windows-x64.exe \
-            QR-Hub-windows-arm64.exe \
-            PostalAnnexQRScanner-windows-x64.exe \
-            PostalAnnexQRScanner-windows-arm64.exe \
-            > checksums.txt
+          sha256sum QR-Hub-windows-x64.exe QR-Hub-windows-arm64.exe > checksums.txt
           cat checksums.txt
 
       - name: Upload checksums artifact
@@ -106,6 +98,4 @@ jobs:
           files: |
             release-artifacts/QR-Hub-windows-x64.exe
             release-artifacts/QR-Hub-windows-arm64.exe
-            release-artifacts/PostalAnnexQRScanner-windows-x64.exe
-            release-artifacts/PostalAnnexQRScanner-windows-arm64.exe
             release-artifacts/checksums.txt
