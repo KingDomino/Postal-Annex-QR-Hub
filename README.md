@@ -1,5 +1,7 @@
 # QR Hub — PostalAnnex+ Amazon QR Code Scanner
 
+[![Download QR Hub](https://img.shields.io/github/v/release/KingDomino/Postal-Annex-QR-Hub?label=Download&logo=windows&style=for-the-badge&color=002f6c)](https://github.com/KingDomino/Postal-Annex-QR-Hub/releases/latest)
+
 Native, offline-first Windows desktop application written in Rust (`eframe` / `egui`) for fast Amazon Return & Happy Return QR scanning, clipboard automation, and direct 4" x 6" thermal label printing via Win32 GDI.
 
 ## Features
