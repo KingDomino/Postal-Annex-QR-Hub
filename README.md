@@ -6,10 +6,10 @@ Native, offline-first Windows desktop application written in Rust (`eframe` / `e
 
 ## Features
 
-- **Zero-Friction Scanning:** Opens straight to **"Ready to Scan"** with an invisible root-level scan capture buffer that automatically clears stray keystrokes after 1 second of inactivity.
-- **100% Counter Business Rules:** Caps Lock case-inversion engine, 4-route classification (`Happy Return`, `No Box No Label`, `Customer Packed`, and fallback `Override`), RMA/payload clipboard copy with retry-on-lock, `Copy All`, and `Reprint Last Label`.
-- **Direct 4" x 6" Win32 Thermal Printing:** Prints immediately via the Windows spooler (`DEVMODEW` 4" x 6" portrait, integer-snapped QR modules at native printer DPI) with zero print dialogs.
-- **Zero-UAC Start Menu Installer & Auto-Updater:** Download and run the single `.exe` once — it installs itself per-user into `%LOCALAPPDATA%\QR Hub\`, adds a **QR Hub** Start Menu shortcut, registers under Windows **Installed Apps**, supports one-click SHA-256 verified GitHub Release updates, and shows a **"What's New?"** dialog after updating.
+- **Zero-Friction Scanning:** Opens straight to **"Ready to Scan"** and makes scanning QR codes fast and painless.
+- **Smart QR Code Classification:** Caps Lock case-inversion engine, carrier classification (`Happy Return`, `No Box No Label`, `Customer Packed`, `UPS`, and fallback `Override`), RMA/payload clipboard copy with retry-on-lock, `Copy All`, and the option to `Reprint Last Label`.
+- **Direct 4" x 6" Thermal Printing:** Prints immediately via the Windows spooler to a 4x6 label printer with zero print dialogs, so nothing slows you down at the counter.
+- **Start Menu Installer & Auto-Updater:** Download and run the single `.exe` once: it installs itself per-user into `%LOCALAPPDATA%\QR Hub\`, adds a **QR Hub** Start Menu shortcut, registers under Windows **Installed Apps**, supports one-click SHA-256 verified GitHub Release updates, and shows a **"What's New?"** dialog after updating.
 - **Built-In Issue Reporting:** Click **"Report an Issue"** in the app footer at any time to open the GitHub Issues tracker directly.
 
 ## Installation (Windows x64 & ARM64)
