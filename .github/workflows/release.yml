@@ -99,6 +99,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          # Tags with a suffix (v2.1.0-test.1) are pre-releases: only PCs on the Test
+          # update channel see them. Plain tags (v2.1.0) go to every PC.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |
             release-artifacts/QR-Hub-windows-x64.exe

@@ -134,6 +134,9 @@ pub struct ScannerApp {
     qr_error: Option<String>,
     /// The last clipboard write failed, so the scan's "Copied" badge would be wrong.
     clipboard_failed: bool,
+    /// Whether Settings shows the update-channel picker; decided on the first Settings
+    /// frame (Shift held while opening) so store staff don't switch channels by accident.
+    pub(super) show_channel_picker: Option<bool>,
     copied_until: Option<Instant>,
     screen_changed_at: Instant,
     pending_prints: VecDeque<PrintOrigin>,
@@ -210,6 +213,7 @@ impl ScannerApp {
         if config.auto_check_updates {
             update_worker.check(
                 config.github_repo.clone(),
+                config.update_channel,
                 true,
                 Some(Duration::from_secs(1)),
             );
@@ -224,6 +228,7 @@ impl ScannerApp {
             cached_qr: None,
             qr_error: None,
             clipboard_failed: false,
+            show_channel_picker: None,
             copied_until: None,
             screen_changed_at: Instant::now(),
             pending_prints: VecDeque::new(),
@@ -257,6 +262,7 @@ impl ScannerApp {
     // -----------------------------------------------------------------------
 
     pub(super) fn open_settings(&mut self) {
+        self.show_channel_picker = None;
         self.whats_new_open = false;
         self.settings_open = true;
         self.scan_buffer.clear();
@@ -311,8 +317,12 @@ impl ScannerApp {
 
     pub(super) fn check_for_updates(&mut self) {
         self.update_phase = UpdatePhase::Checking;
-        self.update_worker
-            .check(self.config.github_repo.trim().to_string(), false, None);
+        self.update_worker.check(
+            self.config.github_repo.trim().to_string(),
+            self.config.update_channel,
+            false,
+            None,
+        );
     }
 
     pub(super) fn start_update_install(&mut self) {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crate::config::{config_dir, DEFAULT_GITHUB_REPO};
+use crate::config::{config_dir, UpdateChannel, DEFAULT_GITHUB_REPO};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +87,15 @@ pub fn is_newer_version(current: &str, candidate_tag: &str) -> Result<bool, Stri
     let cand = Version::parse(strip_v_prefix(candidate_tag))
         .map_err(|e| format!("Invalid release tag \"{candidate_tag}\": {e}"))?;
     Ok(cand > cur)
+}
+
+/// Returns the tag with the highest semantic version (unparseable tags are ignored).
+/// `2.1.0-test.1` sorts below `2.1.0`, so a promoted release always wins over its tests.
+pub fn newest_tag<'a>(tags: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    tags.into_iter()
+        .filter_map(|tag| Version::parse(strip_v_prefix(tag)).ok().map(|v| (v, tag)))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, tag)| tag)
 }
 
 /// Trims whitespace and one leading `v`/`V` from a version tag (`" v2.0.3"` -> `"2.0.3"`).
@@ -303,6 +312,7 @@ pub struct AvailableUpdate {
 pub enum UpdateCommand {
     Check {
         repo: String,
+        channel: UpdateChannel,
         silent: bool,
         initial_delay: Option<Duration>,
     },
@@ -367,6 +377,7 @@ impl UpdateWorker {
                     match cmd {
                         UpdateCommand::Check {
                             repo,
+                            channel,
                             silent,
                             initial_delay,
                         } => {
@@ -378,7 +389,7 @@ impl UpdateWorker {
                             if !emit(UpdateEvent::Checking) {
                                 break;
                             }
-                            run_check(&repo, silent, &emit);
+                            run_check(&repo, channel, silent, &emit);
                         }
                         UpdateCommand::Install(update) => {
                             run_install(&update, &emit);
@@ -407,9 +418,16 @@ impl UpdateWorker {
     }
 
     /// Triggers an asynchronous GitHub Releases check.
-    pub fn check(&self, repo: String, silent: bool, initial_delay: Option<Duration>) {
+    pub fn check(
+        &self,
+        repo: String,
+        channel: UpdateChannel,
+        silent: bool,
+        initial_delay: Option<Duration>,
+    ) {
         let _ = self.tx.send(UpdateCommand::Check {
             repo,
+            channel,
             silent,
             initial_delay,
         });
@@ -462,6 +480,8 @@ mod online {
         #[serde(default)]
         draft: bool,
         #[serde(default)]
+        prerelease: bool,
+        #[serde(default)]
         assets: Vec<GithubAsset>,
     }
 
@@ -493,8 +513,13 @@ mod online {
             .build()
     }
 
-    pub(super) fn run_check(repo: &str, silent: bool, emit: &dyn Fn(UpdateEvent) -> bool) {
-        let event = match check_latest_release(repo) {
+    pub(super) fn run_check(
+        repo: &str,
+        channel: UpdateChannel,
+        silent: bool,
+        emit: &dyn Fn(UpdateEvent) -> bool,
+    ) {
+        let event = match check_latest_release(repo, channel) {
             Ok(Some(update)) => UpdateEvent::Available(update),
             Ok(None) => UpdateEvent::UpToDate { silent },
             Err(message) => UpdateEvent::Error { message, silent },
@@ -502,26 +527,50 @@ mod online {
         let _ = emit(event);
     }
 
-    /// Returns `Some(update)` when the latest GitHub release is newer than this build.
-    fn check_latest_release(repo: &str) -> Result<Option<AvailableUpdate>, String> {
-        let repo = normalize_repo(repo).ok_or_else(|| {
-            "GitHub repository must look like owner/repo (check Settings).".to_string()
-        })?;
-
-        let client = http_client(Duration::from_secs(5))
-            .map_err(|e| format!("Failed to initialize HTTP client: {e}"))?;
-        let resp = client
-            .get(format!(
-                "https://api.github.com/repos/{repo}/releases/latest"
-            ))
+    /// Fetches and decodes a GitHub API JSON response.
+    fn get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
+        let resp = http_client(Duration::from_secs(5))
+            .map_err(|e| format!("Failed to initialize HTTP client: {e}"))?
+            .get(url)
             .send()
             .map_err(|e| format!("Could not reach GitHub Releases: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("GitHub Releases returned HTTP {}", resp.status()));
         }
-        let release: GithubRelease = resp
-            .json()
-            .map_err(|e| format!("Invalid GitHub release payload: {e}"))?;
+        resp.json()
+            .map_err(|e| format!("Invalid GitHub release payload: {e}"))
+    }
+
+    /// Returns `Some(update)` when the newest release on `channel` is newer than this build.
+    ///
+    /// Stable uses GitHub's "latest release", which never includes pre-releases.
+    /// Test picks the highest version among recent published releases, pre-releases included.
+    fn check_latest_release(
+        repo: &str,
+        channel: UpdateChannel,
+    ) -> Result<Option<AvailableUpdate>, String> {
+        let repo = normalize_repo(repo).ok_or_else(|| {
+            "GitHub repository must look like owner/repo (check Settings).".to_string()
+        })?;
+        let api = format!("https://api.github.com/repos/{repo}/releases");
+
+        let release: GithubRelease = match channel {
+            UpdateChannel::Stable => get_json(&format!("{api}/latest"))?,
+            UpdateChannel::Test => {
+                let releases: Vec<GithubRelease> = get_json(&format!("{api}?per_page=20"))?;
+                let tags = releases
+                    .iter()
+                    .filter(|r| !r.draft)
+                    .map(|r| r.tag_name.as_str());
+                let newest = newest_tag(tags)
+                    .ok_or_else(|| "No published releases found.".to_string())?
+                    .to_string();
+                releases
+                    .into_iter()
+                    .find(|r| r.tag_name == newest)
+                    .expect("newest tag comes from this list")
+            }
+        };
 
         if !is_newer_version(CURRENT_VERSION, &release.tag_name)? {
             return Ok(None);
@@ -687,7 +736,8 @@ mod online {
         if current.is_empty() {
             return;
         }
-        let Some(mut candidates) = fetch_release_notes(repo).filter(|c| !c.is_empty()) else {
+        let Some(mut candidates) = fetch_release_notes(repo, current).filter(|c| !c.is_empty())
+        else {
             return;
         };
         // Live GitHub notes come first so they win; local notes cover unpublished versions.
@@ -699,23 +749,20 @@ mod online {
     }
 
     /// Fetches non-empty release notes for the 20 most recent non-draft releases.
-    fn fetch_release_notes(repo: &str) -> Option<Vec<VersionChangelog>> {
+    ///
+    /// Pre-release notes are skipped unless this build *is* that pre-release, so stable
+    /// PCs never list test builds in "What's New?".
+    fn fetch_release_notes(repo: &str, current: &str) -> Option<Vec<VersionChangelog>> {
         let repo = normalize_repo(repo)?;
-        let resp = http_client(Duration::from_secs(5))
-            .ok()?
-            .get(format!(
-                "https://api.github.com/repos/{repo}/releases?per_page=20"
-            ))
-            .send()
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let releases: Vec<GithubRelease> = resp.json().ok()?;
+        let releases: Vec<GithubRelease> = get_json(&format!(
+            "https://api.github.com/repos/{repo}/releases?per_page=20"
+        ))
+        .ok()?;
         Some(
             releases
                 .into_iter()
                 .filter(|r| !r.draft)
+                .filter(|r| !r.prerelease || strip_v_prefix(&r.tag_name) == current)
                 .filter_map(|r| {
                     let notes = r.body.as_deref()?.trim();
                     (!notes.is_empty()).then(|| VersionChangelog {
@@ -732,7 +779,12 @@ mod online {
 use online::{run_check, run_fetch_changelog, run_install};
 
 #[cfg(not(feature = "online-updater"))]
-fn run_check(_repo: &str, silent: bool, emit: &dyn Fn(UpdateEvent) -> bool) {
+fn run_check(
+    _repo: &str,
+    _channel: UpdateChannel,
+    silent: bool,
+    emit: &dyn Fn(UpdateEvent) -> bool,
+) {
     let _ = emit(UpdateEvent::Error {
         message: "Online auto-updater is disabled in this build.".to_string(),
         silent,
@@ -773,7 +825,29 @@ mod tests {
     #[test]
     fn newest_embedded_changelog_matches_cargo_version() {
         // Bumping Cargo.toml without adding notes would show stale notes under a new header.
-        assert_eq!(EMBEDDED_CHANGELOGS[0].0, CURRENT_VERSION);
+        // Test builds (`2.1.0-test.1`) share the notes of the release they lead up to.
+        let mut current = Version::parse(CURRENT_VERSION).unwrap();
+        current.pre = semver::Prerelease::EMPTY;
+        assert_eq!(EMBEDDED_CHANGELOGS[0].0, current.to_string());
+    }
+
+    #[test]
+    fn newest_tag_orders_prereleases_below_their_release() {
+        let tags = ["v2.0.3", "v2.1.0-test.1", "v2.1.0-test.2", "not-a-version"];
+        assert_eq!(newest_tag(tags), Some("v2.1.0-test.2"));
+        assert_eq!(
+            newest_tag(["v2.1.0-test.2", "v2.1.0", "v2.0.3"]),
+            Some("v2.1.0")
+        );
+        assert_eq!(
+            newest_tag(["v2.1.0-test.10", "v2.1.0-test.9"]),
+            Some("v2.1.0-test.10")
+        );
+        assert_eq!(newest_tag([]), None);
+
+        // A test PC moves onto the promoted release; a stable PC never sees test builds as newer.
+        assert!(is_newer_version("2.1.0-test.2", "v2.1.0").unwrap());
+        assert!(!is_newer_version("2.1.0-test.2", "v2.0.3").unwrap());
     }
 
     #[test]
